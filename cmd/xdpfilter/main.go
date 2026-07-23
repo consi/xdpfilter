@@ -232,8 +232,8 @@ func cmdDaemon(args []string) error {
 			log.Printf("reload: %v", err)
 			return
 		}
-		log.Printf("reload: applied — mode=%s, filter_udp=%v, allowlist=%d servers",
-			merged.Mode, merged.FilterUDP, len(merged.ServerAllow))
+		log.Printf("reload: applied — mode=%s, filter_udp=%v, allow_inbound_syn=%v, allowlist=%d servers",
+			merged.Mode, merged.FilterUDP, merged.AllowInboundSYN, len(merged.ServerAllow))
 	}
 
 	reloadCh := make(chan struct{}, 1)

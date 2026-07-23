@@ -72,12 +72,19 @@ func (t *Tuner) Apply() error {
 	ifaces := []string{t.cfg.TrustedIface, t.cfg.UntrustedIface}
 
 	t.applySysctls()
-	for _, ifc := range ifaces {
-		t.applyEthtool(ifc)
+	channels := t.commonChannels(ifaces)
+	t.logf("channels: resolved common count %d", channels)
+	if t.cfg.Tuning.RingSize == 0 {
+		t.logf("rings: retain current driver values")
 	}
-	t.applyIRQBalance()
 	for _, ifc := range ifaces {
-		t.applyIRQAffinity(ifc)
+		t.applyEthtool(ifc, channels)
+	}
+	if ptrOrTrue(t.cfg.Tuning.DisableIRQBal) {
+		t.applyIRQBalance()
+		for _, ifc := range ifaces {
+			t.applyIRQAffinity(ifc)
+		}
 	}
 	t.applyGovernor()
 
@@ -93,14 +100,16 @@ func (t *Tuner) Apply() error {
 
 func (t *Tuner) applySysctls() {
 	tn := t.cfg.Tuning
-	backlog := u32or(tn.NetdevBacklog, 250000)
-	budget := u32or(tn.NetdevBudget, 600)
 	desired := [][2]string{
 		{"net.core.bpf_jit_enable", "1"},
 		{"net.core.bpf_jit_harden", "0"},
-		{"net.core.netdev_max_backlog", strconv.Itoa(int(backlog))},
-		{"net.core.netdev_budget", strconv.Itoa(int(budget))},
 		{"kernel.numa_balancing", "0"},
+	}
+	if tn.NetdevBacklog != 0 {
+		desired = append(desired, [2]string{"net.core.netdev_max_backlog", strconv.Itoa(int(tn.NetdevBacklog))})
+	}
+	if tn.NetdevBudget != 0 {
+		desired = append(desired, [2]string{"net.core.netdev_budget", strconv.Itoa(int(tn.NetdevBudget))})
 	}
 	for _, kv := range desired {
 		key, val := kv[0], kv[1]
@@ -123,7 +132,7 @@ func (t *Tuner) applySysctls() {
 
 // ---- ethtool ----
 
-func (t *Tuner) applyEthtool(ifc string) {
+func (t *Tuner) applyEthtool(ifc string, channels uint32) {
 	tn := t.cfg.Tuning
 
 	// Feature toggles: VLAN offload OFF (tags must reach XDP), LRO OFF.
@@ -146,30 +155,35 @@ func (t *Tuner) applyEthtool(ifc string) {
 		}
 	}
 
-	// Rings.
-	ring := u32or(tn.RingSize, 8192)
-	if rx, tx, ok := ethRings(ifc); ok {
-		t.snap.Rings[ifc] = [2]string{rx, tx}
-		want := strconv.Itoa(int(ring))
-		if rx != want || tx != want {
-			t.logf("ethtool -G %s rx %s tx %s (was rx %s tx %s)", ifc, want, want, rx, tx)
-			if !t.dryRun {
-				t.runStep("ethtool -G "+ifc, "ethtool", "-G", ifc, "rx", want, "tx", want)
+	// A zero ring override means retain the driver's current setting.
+	if tn.RingSize != 0 {
+		if rings, ok := ethRingInfo(ifc); ok {
+			t.snap.Rings[ifc] = [2]string{rings.currentRX, rings.currentTX}
+			rx, tx := tn.RingSize, tn.RingSize
+			if rings.maxRX > 0 && rx > rings.maxRX {
+				rx = rings.maxRX
+			}
+			if rings.maxTX > 0 && tx > rings.maxTX {
+				tx = rings.maxTX
+			}
+			wantRX, wantTX := strconv.Itoa(int(rx)), strconv.Itoa(int(tx))
+			if rings.currentRX != wantRX || rings.currentTX != wantTX {
+				t.logf("ethtool -G %s rx %s tx %s (was rx %s tx %s)",
+					ifc, wantRX, wantTX, rings.currentRX, rings.currentTX)
+				if !t.dryRun {
+					t.runStep("ethtool -G "+ifc, "ethtool", "-G", ifc, "rx", wantRX, "tx", wantTX)
+				}
 			}
 		}
 	}
 
-	// Channels: default = NUMA-local core count (minus housekeeping).
-	chans := tn.Channels
-	if chans == 0 {
-		chans = uint32(len(t.numaCores(ifc)))
-	}
-	if chans > 0 {
-		if cur, ok := ethChannels(ifc); ok {
-			t.snap.Channels[ifc] = cur
-			want := strconv.Itoa(int(chans))
-			if cur != want {
-				t.logf("ethtool -L %s combined %s (was %s)", ifc, want, cur)
+	// Both ports use the same hardware- and CPU-capped channel count.
+	if channels > 0 {
+		if info, ok := ethChannelInfo(ifc); ok {
+			t.snap.Channels[ifc] = info.current
+			want := strconv.Itoa(int(channels))
+			if info.current != want {
+				t.logf("ethtool -L %s combined %s (was %s)", ifc, want, info.current)
 				if !t.dryRun {
 					t.runStep("ethtool -L "+ifc+" combined", "ethtool", "-L", ifc, "combined", want)
 				}
@@ -200,6 +214,48 @@ func (t *Tuner) applyEthtool(ifc string) {
 			}
 		}
 	}
+}
+
+func (t *Tuner) commonChannels(ifaces []string) uint32 {
+	limits := make([]channelLimit, 0, len(ifaces))
+	for _, ifc := range ifaces {
+		coreLimit := uint32(len(t.numaCores(ifc)))
+		if coreLimit == 0 {
+			coreLimit = 1
+		}
+		hardwareLimit := uint32(0)
+		if info, ok := ethChannelInfo(ifc); ok {
+			hardwareLimit = info.maximum
+		}
+		limits = append(limits, channelLimit{cpus: coreLimit, maximum: hardwareLimit})
+	}
+	resolved := resolveCommonChannels(t.cfg.Tuning.Channels, limits)
+	if t.cfg.Tuning.Channels > 0 && resolved < t.cfg.Tuning.Channels {
+		t.logf("channels clamped from %d to common hardware/CPU limit %d",
+			t.cfg.Tuning.Channels, resolved)
+	}
+	return resolved
+}
+
+type channelLimit struct {
+	cpus, maximum uint32
+}
+
+func resolveCommonChannels(requested uint32, ports []channelLimit) uint32 {
+	resolved := requested
+	for _, port := range ports {
+		limit := port.cpus
+		if limit == 0 {
+			limit = 1
+		}
+		if port.maximum > 0 && port.maximum < limit {
+			limit = port.maximum
+		}
+		if resolved == 0 || limit < resolved {
+			resolved = limit
+		}
+	}
+	return resolved
 }
 
 // ---- IRQ ----
@@ -273,6 +329,9 @@ func (t *Tuner) numaCores(ifc string) []int {
 	if len(cpus) == 0 {
 		cpus = parseCPUList(readFileTrim("/sys/devices/system/cpu/online"))
 	}
+	cpus = intersectCPUs(cpus,
+		parseCPUList(readFileTrim("/sys/devices/system/cpu/online")),
+		processAllowedCPUs())
 	hk := t.cfg.HousekeepingCore
 	if hk < 0 && len(cpus) > 0 {
 		hk = cpus[len(cpus)-1] // auto: last core
@@ -285,6 +344,38 @@ func (t *Tuner) numaCores(ifc string) []int {
 	}
 	if len(out) == 0 {
 		return cpus
+	}
+	return out
+}
+
+func processAllowedCPUs() []int {
+	for _, line := range strings.Split(readFileTrim("/proc/self/status"), "\n") {
+		if strings.HasPrefix(line, "Cpus_allowed_list:") {
+			return parseCPUList(strings.TrimSpace(strings.TrimPrefix(line, "Cpus_allowed_list:")))
+		}
+	}
+	return nil
+}
+
+// Empty constraints are ignored, which keeps dry-run previews useful on
+// systems where a topology file is unavailable.
+func intersectCPUs(base []int, constraints ...[]int) []int {
+	out := append([]int(nil), base...)
+	for _, constraint := range constraints {
+		if len(constraint) == 0 {
+			continue
+		}
+		set := make(map[int]struct{}, len(constraint))
+		for _, cpu := range constraint {
+			set[cpu] = struct{}{}
+		}
+		filtered := out[:0]
+		for _, cpu := range out {
+			if _, ok := set[cpu]; ok {
+				filtered = append(filtered, cpu)
+			}
+		}
+		out = filtered
 	}
 	return out
 }
@@ -415,42 +506,89 @@ func ethFeature(ifc, short string) string {
 	return ""
 }
 
-func ethRings(ifc string) (rx, tx string, ok bool) {
-	out := output("ethtool", "-g", ifc)
-	// second block ("Current hardware settings:") holds the live values
-	idx := strings.Index(out, "Current hardware settings:")
-	if idx < 0 {
-		return "", "", false
-	}
-	sc := bufio.NewScanner(strings.NewReader(out[idx:]))
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) == 2 {
-			switch f[0] {
-			case "RX:":
-				rx = f[1]
-			case "TX:":
-				tx = f[1]
-			}
-		}
-	}
-	return rx, tx, rx != "" && tx != ""
+type ringInfo struct {
+	maxRX, maxTX         uint32
+	currentRX, currentTX string
 }
 
-func ethChannels(ifc string) (string, bool) {
-	out := output("ethtool", "-l", ifc)
-	idx := strings.Index(out, "Current hardware settings:")
-	if idx < 0 {
-		return "", false
-	}
-	sc := bufio.NewScanner(strings.NewReader(out[idx:]))
+func ethRingInfo(ifc string) (ringInfo, bool) {
+	return parseRingInfo(output("ethtool", "-g", ifc))
+}
+
+func parseRingInfo(out string) (ringInfo, bool) {
+	var r ringInfo
+	current := false
+	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) == 2 && f[0] == "Combined:" {
-			return f[1], true
+		line := strings.TrimSpace(sc.Text())
+		switch line {
+		case "Pre-set maximums:":
+			current = false
+			continue
+		case "Current hardware settings:":
+			current = true
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(f[1], 10, 32)
+		if err != nil {
+			continue
+		}
+		switch {
+		case !current && f[0] == "RX:":
+			r.maxRX = uint32(v)
+		case !current && f[0] == "TX:":
+			r.maxTX = uint32(v)
+		case current && f[0] == "RX:":
+			r.currentRX = f[1]
+		case current && f[0] == "TX:":
+			r.currentTX = f[1]
 		}
 	}
-	return "", false
+	return r, r.currentRX != "" && r.currentTX != ""
+}
+
+type channelInfo struct {
+	maximum uint32
+	current string
+}
+
+func ethChannelInfo(ifc string) (channelInfo, bool) {
+	return parseChannelInfo(output("ethtool", "-l", ifc))
+}
+
+func parseChannelInfo(out string) (channelInfo, bool) {
+	var c channelInfo
+	current := false
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		switch line {
+		case "Pre-set maximums:":
+			current = false
+			continue
+		case "Current hardware settings:":
+			current = true
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) != 2 || f[0] != "Combined:" {
+			continue
+		}
+		v, err := strconv.ParseUint(f[1], 10, 32)
+		if err != nil {
+			continue
+		}
+		if current {
+			c.current = f[1]
+		} else {
+			c.maximum = uint32(v)
+		}
+	}
+	return c, c.current != ""
 }
 
 func ethPrivFlag(ifc, flag string) string {
@@ -507,13 +645,6 @@ func readFileTrim(p string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
-}
-
-func u32or(v, def uint32) uint32 {
-	if v == 0 {
-		return def
-	}
-	return v
 }
 
 func ptrOrTrue(p *bool) bool { return p == nil || *p }

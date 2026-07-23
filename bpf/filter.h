@@ -121,6 +121,8 @@ struct features {
 	                             * to the source instead of a silent drop (default 0), like an
 	                             * iptables REJECT --reject-with tcp-reset. The source may be
 	                             * spoofed, so the RST can land on an unrelated host. */
+	__u8 allow_inbound_syn;     /* 0/1 — permit inbound lone SYN to any protected IP/port;
+	                             * the selective server allowlist remains an additional path */
 	/* NOTE: ttl_* are in coarse ticks (NOW_SHIFT), not seconds — the loader
 	 * converts config seconds -> ticks. */
 	__u32 ttl_syn;              /* SYN_SENT / SYN_RCVD idle timeout */

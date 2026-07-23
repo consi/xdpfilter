@@ -20,13 +20,13 @@ It runs on any XDP-capable NIC: Mellanox/NVIDIA ConnectX (`mlx5`), Intel (`ice`,
    (SYN, data, query)                     │            (DEVMAP)                        to internet
                                           v
                             ┌────────────────────────────────────────┐
-                            │  shared, pinned BPF maps                │
-                            │    l1cache       per-CPU L1 flow cache  │
-                            │    flows         TCP flow state (LRU)   │
-                            │    udp_flows     UDP flow state (LRU)   │
-                            │    features      live policy + TTLs     │
-                            │    server_allow  inbound allowlist      │
-                            │    stats         per-CPU counters       │
+                            │ shared, pinned BPF maps                │
+                            │   l1cache       per-CPU L1 flow cache  │
+                            │   flows         TCP flow state (LRU)   │
+                            │   udp_flows     UDP flow state (LRU)   │
+                            │   features      live policy + TTLs     │
+                            │   server_allow  inbound allowlist      │
+                            │   stats         per-CPU counters       │
                             └────────────────────────────────────────┘
                                           ^
    inbound   ◄──────────  redirect  ◄─  validate against flow  ◄─  parse  ◄──────────  ◄──────────
@@ -122,8 +122,9 @@ sudo xdpfilter setup
 ```
 
 `setup` lists the interfaces with their probed XDP capability, blinks a port on request
-(`ethtool --identify`), asks which two ports to bridge and for the policy, previews the tuning it will
-apply, and offers to enable the service on boot and start it. It defaults to monitor mode.
+(`ethtool --identify`), asks which two ports to bridge and for the policy, sizes the BPF maps from the
+effective host/cgroup memory and possible CPU count, previews the resolved tuning, and offers to enable
+the service on boot and start it. It defaults to monitor mode.
 
 ```sh
 xdpfilter status                 # live counters, mode, occupancy
@@ -164,6 +165,10 @@ xdpfilter flows          # e.g.
 # UDP   10.0.0.10:51900       1.1.1.1:53            0     UDP       1s
 ```
 
+To admit inbound TCP connections to every protected IP and port, without changing UDP filtering, use
+`allow_inbound_syn: true`. The global TCP switch and the selective allowlist are additive; the SYN
+rate limits still apply to both paths.
+
 ## Configuration
 
 `/etc/xdpfilter/config.yaml`, written by the wizard:
@@ -174,6 +179,7 @@ untrusted_iface: enp65s0f1      # faces the internet
 mode: monitor                   # monitor | enforce
 oos_strict: false               # false adopts flows already established when the box is inserted
 allow_inbound_servers: false    # permit inbound SYN/UDP to allowlisted servers
+allow_inbound_syn: false        # permit inbound TCP SYN to every protected IP and port
 server_allow: []                # ["10.0.0.53:53", ...] — covers TCP and UDP
 filter_udp: true                # stateful UDP filtering
 drop_frags: true                # drop non-first TCP fragments
@@ -181,20 +187,32 @@ drop_bad_flags: true            # drop null / XMAS / SYN+FIN / SYN+RST / FIN-wit
 drop_udp_frags: false           # also drop non-first UDP fragments
 drop_vlan_deep: false           # drop frames with more 802.1Q tags than are inspected (2)
 reject_with_rst: false          # answer enforced inbound TCP drops with a RST to the source (see note below)
-flow_max: 16777216              # TCP flow table capacity (~128 B/entry: 16M is ~2 GiB)
-udp_flow_max: 4194304           # UDP flow table capacity
-l1_size: 65536                  # per-CPU L1 flow-cache slots (power of two; 0 disables)
+flow_max: 16777216              # concrete TCP capacity selected during setup
+udp_flow_max: 4194304           # concrete UDP capacity selected during setup
+l1_size: 65536                  # concrete per-CPU slots (power of two; 0 disables)
 lru_percpu: false               # per-CPU LRU flow tables (no cross-CPU contention on insert)
 ttl_syn: 10                     # seconds; ttl_est: 300; ttl_closing: 10; ttl_udp: 30
 xdp_mode: native                # native | generic | auto (native, generic fallback)
 tune: true                      # apply the tuning profile on start
+tuning:
+  ring_size: 0                  # 0 retains the driver's setting
+  channels: 0                   # 0 derives one common CPU/hardware-capped count
+  netdev_max_backlog: 0         # 0 retains the kernel setting
+  netdev_budget: 0              # 0 retains the kernel setting
 ```
 
-Policy fields (`mode`, `oos_strict`, `allow_inbound_servers`, `server_allow`, `filter_udp`, `drop_frags`,
-`drop_bad_flags`, `drop_udp_frags`, `drop_vlan_deep`, `reject_with_rst`, the TTLs) are applied live when
-the file changes — through inotify, `xdpfilter reload`, or `systemctl reload xdpfilter`. Structural
-changes (interfaces, table sizes, `l1_size`, `lru_percpu`, `xdp_mode`) need a restart, which re-adopts the
-pinned data path without dropping traffic.
+The wizard reserves a bounded portion of currently usable memory, accounts for fixed and per-CPU maps,
+and divides the remaining estimate 4:1 between TCP and UDP. It uses cgroup ancestor limits when they are
+tighter than host RAM; possible CPUs, rather than only online CPUs, are used for per-CPU map estimates.
+The displayed byte costs are conservative planning estimates, not guaranteed kernel allocation sizes.
+The selected numbers are written to YAML: later daemon starts do not silently resize structural maps.
+Expert values entered in the wizard or YAML are preserved, and `lru_percpu` remains opt-in.
+
+Policy fields (`mode`, `oos_strict`, `allow_inbound_servers`, `allow_inbound_syn`, `server_allow`,
+`filter_udp`, `drop_frags`, `drop_bad_flags`, `drop_udp_frags`, `drop_vlan_deep`, `reject_with_rst`, the
+TTLs) are applied live when the file changes — through inotify, `xdpfilter reload`, or
+`systemctl reload xdpfilter`. Structural changes (interfaces, table sizes, `l1_size`, `lru_percpu`,
+`xdp_mode`) need a restart, which re-adopts the pinned data path without dropping traffic.
 
 ### `reject_with_rst`
 
@@ -208,13 +226,17 @@ as `rst replies` in `xdpfilter status`.
 ## Tuning
 
 When `tune` is set, the daemon applies a performance profile on start and snapshots the original values so
-package removal restores them. It sets a few sysctls (`bpf_jit_enable`, `netdev_max_backlog`,
-`netdev_budget`, `numa_balancing=0`), and per port turns VLAN and LRO offload off (VLAN offload must be
-off for XDP to see the tag), raises ring sizes, sets channels to the NUMA-local core count, enables
-symmetric RSS so both directions of a flow land on the same core, and enables `rx_cqe_compress` on mlx5.
-It disables `irqbalance` and pins each port's queue IRQs to matching cores, and sets the CPU governor to
-`performance`. Changes that require a reboot or firmware change (PCIe relaxed ordering, SMT, C-states,
-IOMMU) are printed as recommendations, not applied.
+package removal restores them. It enables the BPF JIT, disables NUMA balancing, and per port turns VLAN
+and LRO offload off (VLAN offload must be off for XDP to see the tag). Automatic channels use one common
+count across both ports, capped by each NIC's advertised combined-channel maximum and its online,
+process-allowed NUMA-local CPUs after reserving the housekeeping CPU. Explicit ring and channel requests
+are clamped to advertised hardware maxima. Zero ring, backlog, and budget overrides retain the current
+driver or kernel values because CPU/RAM alone cannot determine safe optimal values.
+
+The profile also enables symmetric RSS so both directions of a flow land on the same queue index and
+enables `rx_cqe_compress` on mlx5. It disables `irqbalance`, pins each port's queue IRQs to online local
+cores, and sets the CPU governor to `performance`. Changes that require a reboot or firmware change (PCIe
+relaxed ordering, SMT, C-states, IOMMU) are printed as recommendations, not applied.
 
 ## Statistics
 

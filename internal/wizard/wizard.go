@@ -89,6 +89,7 @@ func Run(cfgPath string) error {
 	cfg.OosStrict = !promptYN(in, "Adopt pre-existing flows on insertion (recommended for a live network)?", true)
 	cfg.FilterUDP = promptYN(in, "Statefully filter UDP too (drop unsolicited inbound UDP; protects downstream conntrack)?", true)
 	cfg.RejectWithRST = promptYN(in, "Answer dropped inbound TCP with a RST to the source (like iptables REJECT; the source may be spoofed)?", false)
+	cfg.AllowInboundSYN = promptYN(in, "Allow inbound TCP connections to every protected IP and port?", false)
 	if promptYN(in, "Allow inbound connections to servers behind the box (TCP or UDP)?", false) {
 		cfg.AllowInboundServers = true
 		fmt.Println("  Enter allowlisted servers as ip:port (covers TCP+UDP), blank to finish:")
@@ -106,13 +107,29 @@ func Run(cfgPath string) error {
 	}
 
 	// Flow table sizing.
-	sugg := suggestFlowMax()
-	fm := prompt(in, fmt.Sprintf("Flow table capacity (entries) [%d ~ %s]", sugg, humanBytes(uint64(sugg)*128)), strconv.Itoa(int(sugg)))
-	if v, err := strconv.Atoi(fm); err == nil && v >= 1024 {
-		cfg.FlowMax = uint32(v)
-	} else {
-		cfg.FlowMax = sugg
+	res := config.DetectHostResources()
+	rec := config.RecommendDedicated(res)
+	cfg.FlowMax, cfg.UDPFlowMax, cfg.L1Size = rec.FlowMax, rec.UDPFlowMax, rec.L1Size
+	fmt.Printf("\n-- dedicated-appliance sizing --\n")
+	fmt.Printf("  RAM: %s effective, %s currently available", humanBytes(res.EffectiveMemory), humanBytes(res.MemoryHeadroom))
+	if res.LimitedByCgroup {
+		fmt.Printf(" (cgroup limit %s)", humanBytes(res.CgroupLimit))
 	}
+	fmt.Println()
+	if res.MemoryHeadroom < res.EffectiveMemory/3 {
+		fmt.Println("  map budget is capped by current host/cgroup memory headroom")
+	}
+	fmt.Printf("  CPUs: %d possible (per-CPU map allocation), %d online\n", res.PossibleCPUs, res.OnlineCPUs)
+	fmt.Printf("  suggested BPF maps: %s total against a %s safety-adjusted budget\n",
+		humanBytes(rec.EstimatedBytes), humanBytes(rec.MapBudgetBytes))
+
+	cfg.FlowMax = promptU32(in, "TCP flow table capacity",
+		rec.FlowMax, func(v uint32) bool { return v >= 1024 })
+	cfg.UDPFlowMax = promptU32(in, "UDP flow table capacity",
+		rec.UDPFlowMax, func(v uint32) bool { return v >= 1024 })
+	cfg.L1Size = promptU32(in, fmt.Sprintf("Per-CPU L1 slots [estimated total %s]", humanBytes(rec.L1Bytes)),
+		rec.L1Size, func(v uint32) bool { return v == 0 || (v >= 1024 && v&(v-1) == 0) })
+	fmt.Println("-- end sizing --")
 
 	// Tuning preview.
 	if promptYN(in, "Apply performance tuning (sysctls, NIC, IRQ pinning) on start?", true) {
@@ -219,32 +236,6 @@ func driverOf(ifc string) string {
 	return filepath.Base(link)
 }
 
-func suggestFlowMax() uint32 {
-	memKB := 0
-	if f, err := os.Open("/proc/meminfo"); err == nil {
-		defer f.Close()
-		sc := bufio.NewScanner(f)
-		for sc.Scan() {
-			if strings.HasPrefix(sc.Text(), "MemTotal:") {
-				fields := strings.Fields(sc.Text())
-				if len(fields) >= 2 {
-					memKB, _ = strconv.Atoi(fields[1])
-				}
-				break
-			}
-		}
-	}
-	gb := memKB / 1024 / 1024
-	switch {
-	case gb >= 8:
-		return 1 << 24 // 16M ≈ 2 GiB (default)
-	case gb >= 2:
-		return 1 << 22 // 4M ≈ 512 MiB
-	default:
-		return 1 << 20 // 1M ≈ 128 MiB
-	}
-}
-
 // ---- prompt helpers ----
 
 func prompt(in *bufio.Reader, q, def string) string {
@@ -273,6 +264,16 @@ func promptYN(in *bufio.Reader, q string, def bool) bool {
 		return def
 	}
 	return line == "y" || line == "yes"
+}
+
+func promptU32(in *bufio.Reader, q string, def uint32, valid func(uint32) bool) uint32 {
+	s := prompt(in, q, strconv.FormatUint(uint64(def), 10))
+	v, err := strconv.ParseUint(s, 10, 32)
+	if err != nil || !valid(uint32(v)) {
+		fmt.Printf("  invalid value; using suggested default %d\n", def)
+		return def
+	}
+	return uint32(v)
 }
 
 func runVisible(name string, args ...string) error {

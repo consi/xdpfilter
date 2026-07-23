@@ -95,6 +95,7 @@ drop_vlan_deep: ${DVLAN:-false}
 drop_udp_frags: ${DUDPFRAG:-false}
 reject_with_rst: ${RSTREPLY:-false}
 allow_inbound_servers: ${1:-false}
+allow_inbound_syn: ${ALLOWINBOUNDSYN:-false}
 server_allow: ${2:-[]}
 flow_max: 65536
 udp_flow_max: 65536
@@ -257,8 +258,34 @@ else
 	bad "GC did not reap the half-open flow (before=${n1:-?} after=${n2:-?})"
 fi
 
-# ---- Test 8: live config reload ----
-log "Test 8: live config reload (allowlist, no restart)"
+# ---- Test 8: inbound TCP policy + live config reload ----
+log "Test 8: inbound TCP — default deny, selective allowlist, global SYN switch"
+try_inbound_tcp() {
+	local port="$1"
+	timeout 5 ip netns exec host python3 -c '
+import socket, sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("10.0.0.2",int(sys.argv[1]))); s.listen(1); s.settimeout(3)
+c,_=s.accept(); c.sendall(b"ok")
+' "$port" >/dev/null 2>&1 &
+	local server_pid=$!
+	sleep 0.5
+	local reply
+	reply=$(timeout 3 ip netns exec inet python3 -c '
+import socket, sys
+s=socket.socket(); s.settimeout(2); s.connect(("10.0.0.2",int(sys.argv[1])))
+print(s.recv(10).decode())
+' "$port" 2>/dev/null || true)
+	wait "$server_pid" 2>/dev/null || true
+	[ "$reply" = "ok" ]
+}
+
+if try_inbound_tcp 8080; then
+	bad "inbound TCP reached an unlisted server with both policies off"
+else
+	ok "inbound TCP blocked by default"
+fi
+
 write_config true '["10.0.0.2:8080"]'   # edit -> inotify auto-reload
 sleep 2
 if grep -q "reload: applied.*allowlist=1" /tmp/xdpf-daemon2.log 2>/dev/null; then
@@ -267,6 +294,34 @@ else
 	info "daemon log:"; grep -i reload /tmp/xdpf-daemon2.log 2>/dev/null | sed 's/^/    /'
 	bad "live reload did not apply the allowlist"
 fi
+if try_inbound_tcp 8080; then
+	ok "allowlisted inbound TCP server accepted a connection"
+else
+	bad "allowlisted inbound TCP server was blocked"
+fi
+
+ALLOWINBOUNDSYN=true write_config false '[]'
+sleep 2
+if try_inbound_tcp 8081; then
+	ok "allow_inbound_syn admitted an unlisted TCP destination"
+else
+	bad "allow_inbound_syn did not admit an unlisted TCP destination"
+fi
+
+ud1=$(status_dropped)
+ip netns exec inet python3 -c '
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+for i in range(20): s.sendto(b"x",("10.0.0.2",8081))
+'
+sleep 1
+ud2=$(status_dropped)
+if [ "$(( ${ud2:-0} - ${ud1:-0} ))" -ge 10 ] 2>/dev/null; then
+	ok "allow_inbound_syn left unsolicited UDP filtering enabled"
+else
+	bad "allow_inbound_syn unexpectedly admitted UDP (drop delta=$(( ${ud2:-0} - ${ud1:-0} )))"
+fi
+
 write_config false '[]'
 kill -HUP "$DAEMON_PID" 2>/dev/null; sleep 1
 if grep -q "reload: applied.*allowlist=0" /tmp/xdpf-daemon2.log 2>/dev/null; then

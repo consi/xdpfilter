@@ -29,6 +29,7 @@ type Config struct {
 	Mode                string   `yaml:"mode"`                  // "monitor" | "enforce"
 	OosStrict           bool     `yaml:"oos_strict"`            // false => adopt (default)
 	AllowInboundServers bool     `yaml:"allow_inbound_servers"` // permit inbound SYN to allowlist
+	AllowInboundSYN     bool     `yaml:"allow_inbound_syn"`     // permit inbound TCP SYN to any protected destination
 	ServerAllow         []string `yaml:"server_allow"`          // "ip:port" entries
 	DropFrags           bool     `yaml:"drop_frags"`            // default true
 	DropBadFlags        bool     `yaml:"drop_bad_flags"`        // default true
@@ -60,18 +61,19 @@ type Config struct {
 	Tuning Tuning `yaml:"tuning"`
 }
 
-// Tuning holds NIC/kernel tuning overrides. Zero values mean "derive/skip".
+// Tuning holds NIC/kernel tuning overrides. Zero rings and softnet values
+// retain the current driver/kernel setting; zero channels are auto-resolved.
 type Tuning struct {
-	RingSize      uint32 `yaml:"ring_size"`          // ethtool -G rx/tx (0 => 8192)
-	Channels      uint32 `yaml:"channels"`           // ethtool -L combined (0 => NUMA-local cores)
+	RingSize      uint32 `yaml:"ring_size"`          // ethtool -G rx/tx (0 => retain)
+	Channels      uint32 `yaml:"channels"`           // 0 => common NUMA/hardware limit
 	SymmetricRSS  *bool  `yaml:"symmetric_rss"`      // nil => true
 	CQECompress   *bool  `yaml:"cqe_compress"`       // nil => true
 	DisableLRO    *bool  `yaml:"disable_lro"`        // nil => true
 	DisableVLANHW *bool  `yaml:"disable_vlan_hw"`    // nil => true (rxvlan/txvlan off)
 	DisableIRQBal *bool  `yaml:"disable_irqbalance"` // nil => true
 	Governor      string `yaml:"governor"`           // "" => performance
-	NetdevBacklog uint32 `yaml:"netdev_max_backlog"` // 0 => 250000
-	NetdevBudget  uint32 `yaml:"netdev_budget"`      // 0 => 600
+	NetdevBacklog uint32 `yaml:"netdev_max_backlog"` // 0 => retain
+	NetdevBudget  uint32 `yaml:"netdev_budget"`      // 0 => retain
 }
 
 // Default returns a config with production-sane defaults.
@@ -79,6 +81,7 @@ func Default() *Config {
 	return &Config{
 		Mode:             "monitor", // safe first-run default
 		OosStrict:        false,
+		AllowInboundSYN:  false,
 		DropFrags:        true,
 		DropBadFlags:     true,
 		FilterUDP:        true,
@@ -216,6 +219,7 @@ func (c *Config) ApplyLiveFrom(src *Config) {
 	c.Mode = src.Mode
 	c.OosStrict = src.OosStrict
 	c.AllowInboundServers = src.AllowInboundServers
+	c.AllowInboundSYN = src.AllowInboundSYN
 	c.DropFrags = src.DropFrags
 	c.DropBadFlags = src.DropBadFlags
 	c.FilterUDP = src.FilterUDP

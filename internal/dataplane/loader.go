@@ -98,7 +98,8 @@ type featuresValue struct {
 	DropVlanDeep        uint8
 	DropUDPFrags        uint8
 	RejectWithRST       uint8
-	_                   [3]byte // pad to 4-byte alignment (matches struct features)
+	AllowInboundSYN     uint8
+	_                   [2]byte // pad to 4-byte alignment (matches struct features)
 	// TTLs are in coarse ticks (see secToTicks / NOW_SHIFT), not seconds.
 	TTLSyn     uint32
 	TTLEst     uint32
@@ -127,6 +128,7 @@ func featuresFrom(cfg *config.Config) featuresValue {
 		DropVlanDeep:        b(cfg.DropVlanDeep),
 		DropUDPFrags:        b(cfg.DropUDPFrags),
 		RejectWithRST:       b(cfg.RejectWithRST),
+		AllowInboundSYN:     b(cfg.AllowInboundSYN),
 		TTLSyn:              secToTicks(cfg.TTLSyn),
 		TTLEst:              secToTicks(cfg.TTLEst),
 		TTLClosing:          secToTicks(cfg.TTLClosing),

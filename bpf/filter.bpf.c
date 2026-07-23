@@ -28,8 +28,12 @@
 
 char _license[] SEC("license") = "GPL";
 
-#define likely(x)   __builtin_expect(!!(x), 1)
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 
 /* ---- per-load specialization (rewritten by the Go loader before load) ---- */
 volatile const __u8 ROLE_TRUSTED = 1;  /* 1 on the protected-side port, 0 on internet-side */
@@ -152,6 +156,8 @@ struct {
 	__uint(max_entries, 4096);
 } stats_vlan SEC(".maps");
 
+_Static_assert(sizeof(struct flow_key) == 16, "flow_key must remain exactly 16 bytes");
+
 /* ---- small helpers ---- */
 #define ACT_FORWARD (-1)
 
@@ -167,7 +173,7 @@ static __always_inline struct features *get_features(void)
 	return bpf_map_lookup_elem(&features, &z);
 }
 
-static __always_inline void stat_reason(__u32 reason)
+static __noinline void stat_reason(__u32 reason)
 {
 	__u64 *c = bpf_map_lookup_elem(&drop_reason, &reason);
 	if (c)
@@ -234,20 +240,19 @@ static __always_inline void touch(struct flow_val *v, __u32 now)
 
 static __always_inline int flow_key_eq(const struct flow_key *a, const struct flow_key *b)
 {
-	/* flow_key is __packed, so clang otherwise assumes align-1 and expands each
-	 * field compare into byte loads + shifts (~48 insns) — paid on every L1 hit,
-	 * the line-rate path. Both operands are actually 4-aligned: the map value
-	 * sits at l1_entry offset 0 (8-aligned) and the stack keys are declared
-	 * aligned(4). Asserting that lets LLVM emit natural-width aligned loads. */
-	a = __builtin_assume_aligned(a, 4);
-	b = __builtin_assume_aligned(b, 4);
-	/* field-by-field: every member is naturally aligned, so this is five
-	 * aligned scalar compares (no unaligned 16B load on the packed struct) */
-	return a->inet_ip == b->inet_ip &&
-	       a->host_ip == b->host_ip &&
-	       a->inet_port == b->inet_port &&
-	       a->host_port == b->host_port &&
-	       a->vlans == b->vlans;
+	__u64 a0, a1, b0, b1;
+
+	/* l1_entry.key is at offset zero in an 8-aligned map value and callers
+	 * declare stack keys aligned(8). Copying into scalar words is alias-safe
+	 * and lets LLVM lower the packed key to aligned u64 loads; builtin memcmp
+	 * itself must not be used because its ordering semantics induce byte loads. */
+	a = __builtin_assume_aligned(a, 8);
+	b = __builtin_assume_aligned(b, 8);
+	__builtin_memcpy(&a0, a, sizeof(a0));
+	__builtin_memcpy(&a1, (const char *)a + sizeof(a0), sizeof(a1));
+	__builtin_memcpy(&b0, b, sizeof(b0));
+	__builtin_memcpy(&b1, (const char *)b + sizeof(b0), sizeof(b1));
+	return a0 == b0 && a1 == b1;
 }
 
 /* Murmur3 32-bit finalizer — spreads the folded 4-tuple across the L1 index */
@@ -261,11 +266,11 @@ static __always_inline __u32 fmix32(__u32 h)
 	return h;
 }
 
-static __always_inline __u32 l1_index(const struct flow_key *k)
+static __always_inline __u32 l1_index(const struct flow_key *k, __u32 mask)
 {
 	__u32 h = k->inet_ip ^ k->host_ip ^ k->vlans ^
 		  (((__u32)k->inet_port << 16) | (__u32)k->host_port);
-	return fmix32(h) & L1_MASK;
+	return fmix32(h) & mask;
 }
 
 /* L1 lookup: hit iff the slot holds this exact key, was validated this tick, and
@@ -287,6 +292,14 @@ static __always_inline void l1_put(struct l1_entry *slot, const struct flow_key 
 {
 	if (!slot)
 		return;
+	/* The normal miss is the once-per-tick revalidation of the same entry.
+	 * Avoid rewriting its 16-byte key (and state) in that case; only the tick
+	 * changes. A collision replacement still writes the complete entry. */
+	if (slot->state == state && flow_key_eq(&slot->key, k)) {
+		if (slot->last_seen != now)
+			slot->last_seen = now;
+		return;
+	}
 	slot->key = *k;
 	slot->last_seen = now;
 	slot->state = state;
@@ -367,16 +380,22 @@ static __always_inline int handle_outbound(const struct features *f, struct flow
 	 * (An outbound RST never reaches here — the RST branch above returns early.) */
 	{
 		struct flow_val nv = {};
+		int cacheable = 0;
 		if (flags & TCP_FIN) {
 			nv.state = ST_CLOSING;
 			nv.flags = FL_CLOSED_OUT;
 		} else {
 			nv.state = ST_EST;
-			*cache_st = ST_EST;
+			cacheable = 1;
 		}
 		nv.last_seen = now;
-		if (bpf_map_update_elem(&flows, k, &nv, BPF_ANY))
+		if (bpf_map_update_elem(&flows, k, &nv, BPF_ANY)) {
 			stat_reason(RSN_MAP_FAIL);
+		} else if (cacheable) {
+			/* Never authorize a tuple in L1 when its authoritative insert
+			 * failed: the initiating packet may fail open, not its replies. */
+			*cache_st = ST_EST;
+		}
 	}
 	return ACT_FORWARD;
 }
@@ -386,7 +405,7 @@ static __always_inline int handle_outbound(const struct features *f, struct flow
  * RSS spreads one key's packets across CPUs, so tokens/ts_ns are updated
  * concurrently — every read-modify-write here is atomic so the limit can't leak
  * by a factor of the core count. Returns 1 to admit, 0 to reject. */
-static __always_inline int tbkt_charge(__u32 key, __u64 rate)
+static __noinline int tbkt_charge(__u32 key, __u64 rate)
 {
 	const __u64 burst = rate * 2 * 1000ULL;
 	struct tbkt *b = bpf_map_lookup_elem(&synbkt, &key);
@@ -454,7 +473,7 @@ static __always_inline int syn_global_ok(void)
 }
 
 /* ---- inbound: internet -> trusted. Validate only; never insert unless the
- * inbound-server policy is on and the target is allowlisted. ----
+ * global inbound-SYN policy is on or the target is allowlisted. ----
  * *cache_st is set to ST_EST when the forward decision is L1-cacheable. */
 static __always_inline int handle_inbound(const struct features *f, struct flow_key *k,
 					  __u8 flags, __u32 ack_seq, __u32 now, __u8 *cache_st)
@@ -485,9 +504,9 @@ static __always_inline int handle_inbound(const struct features *f, struct flow_
 	}
 
 	if ((flags & (TCP_SYN | TCP_ACK)) == TCP_SYN) { /* inbound lone SYN (to a server) */
-		if (!f->allow_inbound_servers)
-			return RSN_INBOUND_SYN;
-		{
+		if (!f->allow_inbound_syn) {
+			if (!f->allow_inbound_servers)
+				return RSN_INBOUND_SYN;
 			struct srv_key sk = { .ip = k->host_ip, .port = k->host_port };
 			if (!bpf_map_lookup_elem(&server_allow, &sk))
 				return RSN_INBOUND_SYN;
@@ -553,8 +572,10 @@ static __always_inline int handle_outbound_udp(struct flow_key *k, __u32 now, __
 		struct flow_val nv = {};
 		nv.state = ST_UDP;
 		nv.last_seen = now;
-		if (bpf_map_update_elem(&udp_flows, k, &nv, BPF_ANY))
+		if (bpf_map_update_elem(&udp_flows, k, &nv, BPF_ANY)) {
 			stat_reason(RSN_MAP_FAIL);
+			return ACT_FORWARD; /* failed insert is not authoritative/cacheable */
+		}
 	} else {
 		touch(v, now);
 	}
@@ -588,8 +609,8 @@ static __always_inline int do_forward(struct stats_global *g, __u64 len)
 	return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
 }
 
-static __always_inline int do_drop(const struct features *f, struct stats_global *g,
-				   struct vlan_stat *vs, __u32 reason, __u64 len)
+static __noinline int do_drop(const struct features *f, struct stats_global *g,
+			      struct vlan_stat *vs, __u32 reason, __u64 len)
 {
 	stat_reason(reason);
 	if (f->mode == MODE_ENFORCE) {
@@ -603,6 +624,19 @@ static __always_inline int do_drop(const struct features *f, struct stats_global
 	}
 	/* monitor: forward anyway, but the reason counter recorded the would-drop */
 	return do_forward(g, len);
+}
+
+/* Cold parse failures can happen before the hot path needs policy. Resolve it
+ * only here; retain the bootstrap fail-open behavior if the control map is not
+ * available. */
+static __noinline int do_drop_lazy(struct stats_global *g, struct vlan_stat *vs,
+				   __u32 reason, __u64 len)
+{
+	struct features *f = get_features();
+
+	if (!f)
+		return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
+	return do_drop(f, g, vs, reason, len);
 }
 
 /* ---- optional TCP RST reply (untrusted side only, reject_with_rst) ----
@@ -621,8 +655,8 @@ static __always_inline __u16 csum_fold(__u32 sum)
 
 /* RFC 793 §3.4 reset generation. Returns XDP_TX on success, -1 if bounds fail
  * (caller then falls back to the normal drop). */
-static __always_inline int build_and_send_rst(struct xdp_md *ctx, struct ethhdr *eth,
-					      struct iphdr_min *ip, struct tcphdr_min *tcp)
+static __noinline int build_and_send_rst(struct xdp_md *ctx, struct ethhdr *eth,
+					 struct iphdr_min *ip, struct tcphdr_min *tcp)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	if ((void *)(tcp + 1) > data_end) /* re-assert so the writes below verify */
@@ -730,13 +764,8 @@ int xdp_filter(struct xdp_md *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
 	__u64 len = data_end - data;
-	__u32 now = now_tick();
 	__u32 outer_vid = 0, inner_vid = 0;
 	int vlan_trunc = 0;
-
-	struct features *f = get_features();
-	if (!f) /* control plane not ready — forward, stay transparent (never black-hole) */
-		return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
 
 	struct stats_global *g = sg(); /* one lookup, threaded through every path */
 
@@ -750,7 +779,7 @@ int xdp_filter(struct xdp_md *ctx)
 		struct vlan_stat *vs0 = stat_vlan_ptr(0);
 		if (g) { g->rx_pkts++; g->rx_bytes += len; }
 		if (vs0) { vs0->pkts++; vs0->bytes += len; }
-		return do_drop(f, g, vs0, RSN_MALFORMED, len);
+		return do_drop_lazy(g, vs0, RSN_MALFORMED, len);
 	}
 	__be16 proto = eth->h_proto;
 	void *cur = eth + 1;
@@ -781,11 +810,14 @@ int xdp_filter(struct xdp_md *ctx)
 
 	/* a truncated VLAN tag is a runt we can't parse */
 	if (unlikely(vlan_trunc))
-		return do_drop(f, g, vs, RSN_MALFORMED, len);
+		return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 
 	/* more VLAN tags than MAX_VLAN_DEPTH — L3/L4 is unreachable, so this frame
 	 * bypasses all inspection. Policy decides drop vs. transparent forward. */
 	if (unlikely(proto == bpf_htons(ETH_P_8021Q) || proto == bpf_htons(ETH_P_8021AD))) {
+		struct features *f = get_features();
+		if (!f)
+			return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
 		if (f->drop_vlan_deep)
 			return do_drop(f, g, vs, RSN_VLAN_DEPTH, len);
 		if (g) { g->nonip_pkts++; g->nonip_bytes += len; }
@@ -801,20 +833,25 @@ int xdp_filter(struct xdp_md *ctx)
 	/* IPv4 */
 	struct iphdr_min *ip = cur;
 	if (unlikely((void *)(ip + 1) > data_end))
-		return do_drop(f, g, vs, RSN_MALFORMED, len);
+		return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 	if (unlikely((ip->ver_ihl >> 4) != 4)) /* ethertype says IPv4 but version nibble disagrees */
-		return do_drop(f, g, vs, RSN_MALFORMED, len);
+		return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 	__u32 ihl = (ip->ver_ihl & 0x0F) * 4;
 	if (unlikely(ihl < sizeof(*ip)))
-		return do_drop(f, g, vs, RSN_MALFORMED, len);
+		return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 	void *l4 = (void *)ip + ihl;
 	if (unlikely(l4 > data_end))
-		return do_drop(f, g, vs, RSN_MALFORMED, len);
+		return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 
 	/* TCP first: it is the dominant, filtered protocol */
 	if (likely(ip->protocol == IPPROTO_TCP)) {
+		struct features *f = NULL;
+
 		/* non-first fragment of a TCP datagram (evasion-shaped) */
 		if (unlikely(ip->frag_off & bpf_htons(IP_FRAG_OFF_MASK))) {
+			f = get_features();
+			if (!f)
+				return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
 			if (f->drop_frags)
 				return do_drop(f, g, vs, RSN_TCP_FRAG, len);
 			return do_forward(g, len);
@@ -822,24 +859,36 @@ int xdp_filter(struct xdp_md *ctx)
 
 		struct tcphdr_min *tcp = l4;
 		if (unlikely((void *)(tcp + 1) > data_end))
-			return do_drop(f, g, vs, RSN_MALFORMED, len);
+			return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 		/* data-offset must cover the 20-byte fixed header, and tot_len must reach
 		 * past IP options + the full TCP header. Rejects RFC-invalid doff,
 		 * Ethernet-padding-parsed-as-L4, and RFC 1858 tiny-first-fragment flag
 		 * evasion. In-header fields only -> safe under xdp.frags multi-buffer. */
 		__u32 doff = (__u32)(tcp->doff_res >> 4) * 4;
 		if (unlikely(doff < sizeof(*tcp) || bpf_ntohs(ip->tot_len) < ihl + doff))
-			return do_drop(f, g, vs, RSN_MALFORMED, len);
+			return do_drop_lazy(g, vs, RSN_MALFORMED, len);
 		__u8 flags = tcp->flags;
+		__u32 l1_mask = L1_MASK;
+		__u8 trusted = ROLE_TRUSTED;
 
-		if (f->drop_bad_flags && unlikely(bad_flags(flags)))
-			return do_drop_tcp(ctx, f, g, vs, RSN_BAD_FLAGS, len, eth, ip, tcp);
+		/* Every L1-eligible packet is ACK-bearing with SYN/FIN/RST clear, so
+		 * bad_flags() cannot reject it. Resolve live policy before time/state
+		 * work only for packets which do not have that proof. */
+		int l1_ok = l1_mask && ((flags & (TCP_SYN | TCP_FIN | TCP_RST)) == 0) &&
+			    (flags & TCP_ACK);
+		if (!l1_ok) {
+			f = get_features();
+			if (!f)
+				return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
+			if (f->drop_bad_flags && unlikely(bad_flags(flags)))
+				return do_drop_tcp(ctx, f, g, vs, RSN_BAD_FLAGS, len, eth, ip, tcp);
+		}
 
-		/* normalized, direction-independent key (aligned(4) so flow_key_eq's
+		/* normalized, direction-independent key (aligned(8) so flow_key_eq's
 		 * assume_aligned holds for the stack operand — see flow_key_eq) */
-		struct flow_key k __attribute__((aligned(4))) = {};
+		struct flow_key k __attribute__((aligned(8))) = {};
 		k.vlans = ((__u32)outer_vid << 12) | inner_vid;
-		if (ROLE_TRUSTED) {
+		if (trusted) {
 			k.host_ip = ip->saddr;
 			k.inet_ip = ip->daddr;
 			k.host_port = tcp->source;
@@ -851,14 +900,14 @@ int xdp_filter(struct xdp_md *ctx)
 			k.host_port = tcp->dest;
 		}
 
+		__u32 now = now_tick();
+
 		/* L1 fast path: pure ACK/data (no SYN/FIN/RST) on an established flow.
 		 * The ACK requirement also excludes null-scans. */
 		__u32 l1_idx = 0;
 		struct l1_entry *slot = NULL;
-		int l1_ok = L1_MASK && ((flags & (TCP_SYN | TCP_FIN | TCP_RST)) == 0) &&
-			    (flags & TCP_ACK);
 		if (l1_ok) {
-			l1_idx = l1_index(&k);
+			l1_idx = l1_index(&k, l1_mask);
 			if (l1_hit(l1_idx, &k, ST_EST, now, &slot)) {
 				if (g)
 					g->l1_hits++;
@@ -866,9 +915,15 @@ int xdp_filter(struct xdp_md *ctx)
 			}
 		}
 
+		if (!f) {
+			f = get_features();
+			if (!f)
+				return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
+		}
+
 		__u8 cache_st = 0;
 		int r;
-		if (ROLE_TRUSTED)
+		if (trusted)
 			r = handle_outbound(f, &k, flags, bpf_ntohl(tcp->seq), now, &cache_st);
 		else
 			r = handle_inbound(f, &k, flags, bpf_ntohl(tcp->ack_seq), now, &cache_st);
@@ -882,7 +937,13 @@ int xdp_filter(struct xdp_md *ctx)
 	}
 
 	/* UDP: stateful reply-only filtering (protect the destination's conntrack) */
-	if (ip->protocol == IPPROTO_UDP && f->filter_udp) {
+	if (ip->protocol == IPPROTO_UDP) {
+		struct features *f = get_features();
+		if (!f)
+			return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
+		if (!f->filter_udp)
+			goto nontcp;
+
 		/* a non-first fragment has no L4 ports — can't key it; policy decides */
 		if (unlikely(ip->frag_off & bpf_htons(IP_FRAG_OFF_MASK))) {
 			if (f->drop_udp_frags)
@@ -896,9 +957,10 @@ int xdp_filter(struct xdp_md *ctx)
 		 * tiny-first-fragment guard; in-header fields only) */
 		if (unlikely(bpf_ntohs(ip->tot_len) < ihl + sizeof(*udp)))
 			return do_drop(f, g, vs, RSN_MALFORMED, len);
-		struct flow_key uk __attribute__((aligned(4))) = {};
+		struct flow_key uk __attribute__((aligned(8))) = {};
+		__u8 trusted = ROLE_TRUSTED;
 		uk.vlans = ((__u32)outer_vid << 12) | inner_vid;
-		if (ROLE_TRUSTED) {
+		if (trusted) {
 			uk.host_ip = ip->saddr;
 			uk.inet_ip = ip->daddr;
 			uk.host_port = udp->source;
@@ -913,8 +975,10 @@ int xdp_filter(struct xdp_md *ctx)
 		/* L1 fast path for established UDP pseudo-flows */
 		__u32 l1_idx = 0;
 		struct l1_entry *slot = NULL;
-		if (L1_MASK) {
-			l1_idx = l1_index(&uk);
+		__u32 l1_mask = L1_MASK;
+		__u32 now = now_tick();
+		if (l1_mask) {
+			l1_idx = l1_index(&uk, l1_mask);
 			if (l1_hit(l1_idx, &uk, ST_UDP, now, &slot)) {
 				if (g)
 					g->l1_hits++;
@@ -923,10 +987,10 @@ int xdp_filter(struct xdp_md *ctx)
 		}
 
 		__u8 cache_st = 0;
-		int ur = ROLE_TRUSTED ? handle_outbound_udp(&uk, now, &cache_st)
-				      : handle_inbound_udp(f, &uk, now, &cache_st);
+		int ur = trusted ? handle_outbound_udp(&uk, now, &cache_st)
+				 : handle_inbound_udp(f, &uk, now, &cache_st);
 		if (ur == ACT_FORWARD) {
-			if (L1_MASK && cache_st == ST_UDP)
+			if (l1_mask && cache_st == ST_UDP)
 				l1_put(slot, &uk, ST_UDP, now);
 			return do_forward(g, len);
 		}
@@ -934,6 +998,7 @@ int xdp_filter(struct xdp_md *ctx)
 	}
 
 	/* IPv4 non-TCP (and UDP with filtering off) — forward transparently */
+nontcp:
 	if (g) { g->nontcp_pkts++; g->nontcp_bytes += len; }
 	return do_forward(g, len);
 }
