@@ -43,6 +43,7 @@ type statsGlobalValue struct {
 	NonIPPkts, NonIPBytes   uint64
 	NonTCPPkts, NonTCPBytes uint64
 	L1Hits                  uint64
+	RstPkts, RstBytes       uint64
 }
 
 type vlanStatValue struct {
@@ -77,6 +78,8 @@ func Collect(m *dataplane.SharedMaps) (Snapshot, error) {
 		s.G.NonTCPPkts += c.NonTCPPkts
 		s.G.NonTCPBytes += c.NonTCPBytes
 		s.G.L1Hits += c.L1Hits
+		s.G.RstPkts += c.RstPkts
+		s.G.RstBytes += c.RstBytes
 	}
 
 	for r := uint32(0); r < numReasons; r++ {
@@ -191,6 +194,12 @@ func (r *Reporter) render(cur *Snapshot, mode string) (report, warn string) {
 			d = cur.G.L1Hits - r.prev.G.L1Hits
 		}
 		fmt.Fprintf(&b, "  %-12s %16s %10s %14s\n", "l1 hits", comma(cur.G.L1Hits), ratePerSec(d, secs), "")
+	}
+
+	// RST replies: enforced TCP drops answered with a RST to the source instead
+	// of a silent drop (reject_with_rst, untrusted side). Zero unless enabled.
+	if cur.G.RstPkts > 0 {
+		row("rst replies", cur.G.RstPkts, cur.G.RstBytes)
 	}
 
 	// drops by reason (this interval)

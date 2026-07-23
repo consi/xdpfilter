@@ -234,6 +234,13 @@ static __always_inline void touch(struct flow_val *v, __u32 now)
 
 static __always_inline int flow_key_eq(const struct flow_key *a, const struct flow_key *b)
 {
+	/* flow_key is __packed, so clang otherwise assumes align-1 and expands each
+	 * field compare into byte loads + shifts (~48 insns) — paid on every L1 hit,
+	 * the line-rate path. Both operands are actually 4-aligned: the map value
+	 * sits at l1_entry offset 0 (8-aligned) and the stack keys are declared
+	 * aligned(4). Asserting that lets LLVM emit natural-width aligned loads. */
+	a = __builtin_assume_aligned(a, 4);
+	b = __builtin_assume_aligned(b, 4);
 	/* field-by-field: every member is naturally aligned, so this is five
 	 * aligned scalar compares (no unaligned 16B load on the packed struct) */
 	return a->inet_ip == b->inet_ip &&
@@ -335,6 +342,12 @@ static __always_inline int handle_outbound(const struct features *f, struct flow
 				v->state = ST_EST;
 				*cache_st = ST_EST;
 			}
+		} else if (v->state == ST_SYN_RCVD && (flags & TCP_SYN)) {
+			/* our server's SYN-ACK to an inbound-initiated handshake: the client
+			 * hasn't ACKed yet, so keep SYN_RCVD (ttl_syn) rather than promoting to
+			 * EST (ttl_est). A blind spoofed inbound SYN can thus only tie up a slot
+			 * for ttl_syn, not the full established timeout; the client's inbound ACK
+			 * completes the promotion (see handle_inbound). Not L1-cacheable. */
 		} else {
 			v->state = ST_EST; /* ACK/data/SYN-ACK promotes */
 			*cache_st = ST_EST;
@@ -347,46 +360,97 @@ static __always_inline int handle_outbound(const struct features *f, struct flow
 	if (f->oos_out_strict)
 		return RSN_OOS_OUT;
 
-	/* adopt: the trusted side is inserted into a live network */
+	/* adopt: the trusted side is inserted into a live network. An outbound FIN
+	 * adopts straight into CLOSING (draining, ttl_closing) with FL_CLOSED_OUT — the
+	 * tail-end close of a pre-existing connection shouldn't be resurrected as a
+	 * fresh ttl_est flow. Everything else adopts as EST and is L1-cacheable.
+	 * (An outbound RST never reaches here — the RST branch above returns early.) */
 	{
 		struct flow_val nv = {};
-		nv.state = ST_EST;
+		if (flags & TCP_FIN) {
+			nv.state = ST_CLOSING;
+			nv.flags = FL_CLOSED_OUT;
+		} else {
+			nv.state = ST_EST;
+			*cache_st = ST_EST;
+		}
 		nv.last_seen = now;
 		if (bpf_map_update_elem(&flows, k, &nv, BPF_ANY))
 			stat_reason(RSN_MAP_FAIL);
 	}
-	*cache_st = ST_EST;
 	return ACT_FORWARD;
 }
 
-/* per-source SYN rate limit for the inbound-server path (policy on only) */
-static __always_inline int syn_token_ok(__u32 src_ip)
+/* Token-bucket core (fixed-point *1000): charge one packet against the bucket
+ * stored under `key` in synbkt at `rate` tokens/s, burst = 2s worth. Symmetric
+ * RSS spreads one key's packets across CPUs, so tokens/ts_ns are updated
+ * concurrently — every read-modify-write here is atomic so the limit can't leak
+ * by a factor of the core count. Returns 1 to admit, 0 to reject. */
+static __always_inline int tbkt_charge(__u32 key, __u64 rate)
 {
-	/* ~50 SYN/s, burst 100, fixed-point *1000 */
-	const __u64 rate = 50, burst = 100 * 1000ULL;
-	struct tbkt *b = bpf_map_lookup_elem(&synbkt, &src_ip);
+	const __u64 burst = rate * 2 * 1000ULL;
+	struct tbkt *b = bpf_map_lookup_elem(&synbkt, &key);
 	__u64 tnow = bpf_ktime_get_coarse_ns();
 
 	if (!b) {
 		struct tbkt nb = { .tokens = burst - 1000, .ts_ns = tnow };
-		bpf_map_update_elem(&synbkt, &src_ip, &nb, BPF_ANY);
+		bpf_map_update_elem(&synbkt, &key, &nb, BPF_ANY);
 		return 1;
 	}
-	{
-		/* guard cross-CPU clock skew: a negative delta must not refill */
-		__u64 elapsed = (tnow >= b->ts_ns) ? (tnow - b->ts_ns) : 0;
-		__u64 add = (elapsed * rate) / 1000000ULL; /* ns -> tokens*1000 */
-		__u64 tok = b->tokens + add;
-		if (tok > burst)
-			tok = burst;
-		b->ts_ns = tnow;
-		if (tok < 1000) {
-			b->tokens = tok;
-			return 0;
+
+	/* Refill: elect a single refiller per interval with a CAS on ts_ns so
+	 * concurrent CPUs can't double-credit (the loser's CAS fails and it skips).
+	 * The clock is read per-CPU; the (tnow > last) test also guards cross-CPU
+	 * skew (a stale/negative delta never refills). add uses a shift, not a
+	 * BPF_DIV64: >>20 is ÷1048576 ≈ ÷1e6, i.e. ~4.6% stricter than nominal. */
+	__u64 last = b->ts_ns;
+	if (tnow > last && (tnow - last) >= (1ULL << 20)) { /* ~1.05 ms min interval */
+		if (__sync_val_compare_and_swap(&b->ts_ns, last, tnow) == last) {
+			__u64 add = ((tnow - last) * rate) >> 20;
+			__u64 cur = b->tokens;
+			if (cur < burst) {
+				__u64 room = burst - cur;
+				if (add > room)
+					add = room; /* clamp to headroom: can't overshoot burst */
+				if (add)
+					__sync_fetch_and_add(&b->tokens, add);
+			}
 		}
-		b->tokens = tok - 1000;
-		return 1;
 	}
+
+	/* Spend one packet with a bounded atomic CAS. On sustained contention (many
+	 * CPUs charging the same key at once — i.e. an in-progress flood on a single
+	 * source) fail-open after a few tries rather than spin or risk corrupting the
+	 * counter via a fetch-and-sub underflow race. */
+#pragma unroll
+	for (int i = 0; i < 4; i++) {
+		__u64 cur = b->tokens;
+		if (cur < 1000)
+			return 0;
+		if (__sync_val_compare_and_swap(&b->tokens, cur, cur - 1000) == cur)
+			return 1;
+	}
+	return 1;
+}
+
+/* per-source SYN rate limit for the inbound-server path (policy on only).
+ * src_ip is network-order; 0.0.0.0 is never a routable source, so it can't
+ * collide with syn_global_ok's reserved key 0. ~50 SYN/s, burst 100. */
+static __always_inline int syn_token_ok(__u32 src_ip)
+{
+	return tbkt_charge(src_ip, 50);
+}
+
+/* Global admission cap on inbound-server SYNs, charged in addition to the
+ * per-source bucket. A spoofed flood from *random* sources sails through every
+ * per-source bucket (each source is new) and would otherwise insert a SYN_RCVD
+ * flow per packet, churning the shared LRU tables and evicting live flows. This
+ * bounds the aggregate SYN-insert rate. Keyed at 0 (0.0.0.0 can't be a real
+ * source, so it never aliases a per-source bucket). Rate is fixed here (filter.h
+ * has no config slot for it); 64x the per-source rate is generous headroom. */
+static __always_inline int syn_global_ok(void)
+{
+	return tbkt_charge(0, 50 * 64);
 }
 
 /* ---- inbound: internet -> trusted. Validate only; never insert unless the
@@ -401,10 +465,20 @@ static __always_inline int handle_inbound(const struct features *f, struct flow_
 	if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) { /* SYN-ACK — the headline */
 		if (!live)
 			return RSN_UNSOL_SYNACK;
-		if (v->state == ST_SYN_SENT) {
-			if (!(v->flags & FL_ISN_VALID) || ack_seq != v->client_isn + 1)
+		/* Validate the ack against the stored ISN for ANY live outbound-initiated
+		 * flow (FL_ISN_VALID), not just ST_SYN_SENT: otherwise a spoofed SYN-ACK on
+		 * an already-ESTABLISHED/CLOSING tuple is forwarded and refreshes the flow's
+		 * TTL. Legit SYN-ACK retransmits always ack isn+1, so this is FP-free except
+		 * for TCP Fast Open (SYN carried data -> SYN-ACK acks isn+1+datalen), which
+		 * the pre-existing ST_SYN_SENT check already dropped — no new FP class.
+		 * Adopted / inbound-server (ST_SYN_RCVD) flows have flags==0 and stay exempt. */
+		if (v->flags & FL_ISN_VALID) {
+			if (ack_seq != v->client_isn + 1)
 				return RSN_BAD_ISN;
-			v->state = ST_EST;
+			if (v->state == ST_SYN_SENT)
+				v->state = ST_EST;
+		} else if (v->state == ST_SYN_SENT) {
+			return RSN_BAD_ISN; /* SYN_SENT always has a valid ISN; preserved defensively */
 		}
 		touch(v, now);
 		return ACT_FORWARD;
@@ -420,23 +494,36 @@ static __always_inline int handle_inbound(const struct features *f, struct flow_
 		}
 		if (!syn_token_ok(k->inet_ip))
 			return RSN_INBOUND_SYN;
+		/* global backstop: caps the aggregate inbound-SYN insert rate so a
+		 * random-source flood can't churn the LRU tables (see syn_global_ok) */
+		if (!syn_global_ok())
+			return RSN_INBOUND_SYN;
 		/* reset a fresh SYN_RCVD only over an absent / expired / closing slot;
 		 * a live SYN_SENT/EST/SYN_RCVD is left intact so a spoofed inbound SYN
-		 * on a live tuple can't clobber an in-flight handshake's ISN state. */
-		if (!v || expired(f, v, now) || v->state == ST_CLOSING) {
+		 * on a live tuple can't clobber an in-flight handshake's ISN state. We
+		 * deliberately do NOT touch() a live slot here: a rate-limited spoofed SYN
+		 * retransmit must not be able to refresh a live flow's TTL indefinitely. A
+		 * genuinely stalled handshake self-heals — once it ages past ttl_syn the
+		 * next SYN retransmit falls into this recreate branch with a fresh stamp. */
+		if (!live || v->state == ST_CLOSING) {
 			struct flow_val nv = {};
 			nv.state = ST_SYN_RCVD;
 			nv.last_seen = now;
 			if (bpf_map_update_elem(&flows, k, &nv, BPF_ANY))
 				stat_reason(RSN_MAP_FAIL);
-		} else {
-			touch(v, now);
 		}
 		return ACT_FORWARD;
 	}
 
 	if (flags & TCP_RST) {
 		if (!live)
+			return RSN_OOS_RST;
+		/* RFC 793: a RST while we're in SYN-SENT is acceptable only if it acks the
+		 * SYN (ack == isn+1). Requiring that stops a blind spoofed RST at a
+		 * connecting tuple from being forwarded and flipping us to CLOSING. A
+		 * conforming peer refusing the connection always sends RST+ACK acking isn+1. */
+		if (v->state == ST_SYN_SENT && (v->flags & FL_ISN_VALID) &&
+		    (!(flags & TCP_ACK) || ack_seq != v->client_isn + 1))
 			return RSN_OOS_RST;
 		v->state = ST_CLOSING; /* inbound close: no FL_CLOSED_OUT (may be spoofed) */
 		touch(v, now);
@@ -516,6 +603,125 @@ static __always_inline int do_drop(const struct features *f, struct stats_global
 	}
 	/* monitor: forward anyway, but the reason counter recorded the would-drop */
 	return do_forward(g, len);
+}
+
+/* ---- optional TCP RST reply (untrusted side only, reject_with_rst) ----
+ * Like an iptables REJECT --reject-with tcp-reset: instead of silently dropping
+ * an enforced TCP drop, rewrite the frame in place into a RST addressed back to
+ * the packet's source and XDP_TX it out the ingress port. The source may be
+ * spoofed, so the RST can land on an unrelated host — hence opt-in. */
+
+/* fold a 32-bit ones-complement accumulator down to the 16-bit checksum */
+static __always_inline __u16 csum_fold(__u32 sum)
+{
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return (__u16)~sum;
+}
+
+/* RFC 793 §3.4 reset generation. Returns XDP_TX on success, -1 if bounds fail
+ * (caller then falls back to the normal drop). */
+static __always_inline int build_and_send_rst(struct xdp_md *ctx, struct ethhdr *eth,
+					      struct iphdr_min *ip, struct tcphdr_min *tcp)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	if ((void *)(tcp + 1) > data_end) /* re-assert so the writes below verify */
+		return -1;
+
+	/* originals (network order unless noted) */
+	__u8 in_flags = tcp->flags;
+	__be32 in_seq = tcp->seq;
+	__be32 in_ack = tcp->ack_seq;
+	__u32 ihl = (ip->ver_ihl & 0x0F) * 4;
+	__u16 tot_len = bpf_ntohs(ip->tot_len); /* host order */
+	__u32 doff = (__u32)(tcp->doff_res >> 4) * 4;
+
+	/* RST seq/ack: if the segment carried ACK, seq = seg.ACK (no ACK flag);
+	 * otherwise seq = 0, ACK = seg.SEQ + seg.LEN (SYN and FIN each count 1). */
+	__be32 rst_seq, rst_ack;
+	__u8 rst_flags;
+	if (in_flags & TCP_ACK) {
+		rst_seq = in_ack;
+		rst_ack = 0;
+		rst_flags = TCP_RST;
+	} else {
+		__u32 seglen = (__u32)tot_len - ihl - doff;
+		if (in_flags & TCP_SYN)
+			seglen += 1;
+		if (in_flags & TCP_FIN)
+			seglen += 1;
+		rst_seq = 0;
+		rst_ack = bpf_htonl(bpf_ntohl(in_seq) + seglen);
+		rst_flags = TCP_RST | TCP_ACK;
+	}
+
+	/* swap L2 MACs (frame is bounced back out the ingress port) */
+	__u8 mac[ETH_ALEN];
+	__builtin_memcpy(mac, eth->dest, ETH_ALEN);
+	__builtin_memcpy(eth->dest, eth->source, ETH_ALEN);
+	__builtin_memcpy(eth->source, mac, ETH_ALEN);
+
+	/* swap L3 addrs (checksum-neutral: only tot_len changes below) */
+	__be32 sip = ip->saddr;
+	ip->saddr = ip->daddr;
+	ip->daddr = sip;
+
+	/* shrink IP total length to a 20-byte TCP header (IP options, if any, kept)
+	 * and patch the IP checksum incrementally (RFC 1624) for that one field */
+	__u16 new_len = ihl + sizeof(*tcp);
+	__u32 ics = (__u16)~bpf_ntohs(ip->check);
+	ics += (__u16)~tot_len;
+	ics += new_len;
+	ip->tot_len = bpf_htons(new_len);
+	ip->check = bpf_htons(csum_fold(ics));
+
+	/* swap L4 ports, write the RST header, recompute the TCP checksum in full */
+	__be16 sp = tcp->source;
+	tcp->source = tcp->dest;
+	tcp->dest = sp;
+	tcp->seq = rst_seq;
+	tcp->ack_seq = rst_ack;
+	tcp->doff_res = 0x50; /* data offset 5, no options */
+	tcp->flags = rst_flags;
+	tcp->window = 0;
+	tcp->urg_ptr = 0;
+	tcp->check = 0;
+
+	/* pseudo-header + the 20-byte header, summed as raw network-order words
+	 * (endian-consistent: the fold is stored back raw) */
+	__u32 sum = 0;
+	__u16 *sa = (__u16 *)&ip->saddr;
+	__u16 *da = (__u16 *)&ip->daddr;
+	sum += sa[0] + sa[1] + da[0] + da[1];
+	sum += bpf_htons(IPPROTO_TCP) + bpf_htons(sizeof(*tcp));
+	__u16 *w = (__u16 *)tcp;
+#pragma unroll
+	for (int i = 0; i < (int)(sizeof(*tcp) / 2); i++)
+		sum += w[i];
+	tcp->check = csum_fold(sum);
+
+	return XDP_TX;
+}
+
+/* TCP-drop wrapper: on the untrusted side in enforce mode with reject_with_rst,
+ * answer with a RST instead of a silent drop. On the trusted side the leading
+ * !ROLE_TRUSTED (frozen rodata) prunes to a plain do_drop. */
+static __always_inline int do_drop_tcp(struct xdp_md *ctx, const struct features *f,
+				       struct stats_global *g, struct vlan_stat *vs,
+				       __u32 reason, __u64 len, struct ethhdr *eth,
+				       struct iphdr_min *ip, struct tcphdr_min *tcp)
+{
+	if (!ROLE_TRUSTED && f->mode == MODE_ENFORCE && f->reject_with_rst) {
+		if (build_and_send_rst(ctx, eth, ip, tcp) == XDP_TX) {
+			stat_reason(reason); /* keep the per-vector counter visible */
+			if (g) {
+				g->rst_pkts++;
+				g->rst_bytes += len;
+			}
+			return XDP_TX;
+		}
+	}
+	return do_drop(f, g, vs, reason, len);
 }
 
 SEC("xdp.frags")
@@ -617,13 +823,21 @@ int xdp_filter(struct xdp_md *ctx)
 		struct tcphdr_min *tcp = l4;
 		if (unlikely((void *)(tcp + 1) > data_end))
 			return do_drop(f, g, vs, RSN_MALFORMED, len);
+		/* data-offset must cover the 20-byte fixed header, and tot_len must reach
+		 * past IP options + the full TCP header. Rejects RFC-invalid doff,
+		 * Ethernet-padding-parsed-as-L4, and RFC 1858 tiny-first-fragment flag
+		 * evasion. In-header fields only -> safe under xdp.frags multi-buffer. */
+		__u32 doff = (__u32)(tcp->doff_res >> 4) * 4;
+		if (unlikely(doff < sizeof(*tcp) || bpf_ntohs(ip->tot_len) < ihl + doff))
+			return do_drop(f, g, vs, RSN_MALFORMED, len);
 		__u8 flags = tcp->flags;
 
 		if (f->drop_bad_flags && unlikely(bad_flags(flags)))
-			return do_drop(f, g, vs, RSN_BAD_FLAGS, len);
+			return do_drop_tcp(ctx, f, g, vs, RSN_BAD_FLAGS, len, eth, ip, tcp);
 
-		/* normalized, direction-independent key */
-		struct flow_key k = {};
+		/* normalized, direction-independent key (aligned(4) so flow_key_eq's
+		 * assume_aligned holds for the stack operand — see flow_key_eq) */
+		struct flow_key k __attribute__((aligned(4))) = {};
 		k.vlans = ((__u32)outer_vid << 12) | inner_vid;
 		if (ROLE_TRUSTED) {
 			k.host_ip = ip->saddr;
@@ -664,7 +878,7 @@ int xdp_filter(struct xdp_md *ctx)
 				l1_put(slot, &k, ST_EST, now);
 			return do_forward(g, len);
 		}
-		return do_drop(f, g, vs, (__u32)r, len);
+		return do_drop_tcp(ctx, f, g, vs, (__u32)r, len, eth, ip, tcp);
 	}
 
 	/* UDP: stateful reply-only filtering (protect the destination's conntrack) */
@@ -678,7 +892,11 @@ int xdp_filter(struct xdp_md *ctx)
 		struct udphdr_min *udp = l4;
 		if (unlikely((void *)(udp + 1) > data_end))
 			return do_drop(f, g, vs, RSN_MALFORMED, len);
-		struct flow_key uk = {};
+		/* tot_len must reach past IP options + the 8-byte UDP header (padding /
+		 * tiny-first-fragment guard; in-header fields only) */
+		if (unlikely(bpf_ntohs(ip->tot_len) < ihl + sizeof(*udp)))
+			return do_drop(f, g, vs, RSN_MALFORMED, len);
+		struct flow_key uk __attribute__((aligned(4))) = {};
 		uk.vlans = ((__u32)outer_vid << 12) | inner_vid;
 		if (ROLE_TRUSTED) {
 			uk.host_ip = ip->saddr;

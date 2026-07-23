@@ -117,6 +117,10 @@ struct features {
 	__u8 filter_udp;            /* 0/1 — stateful UDP filtering (default 1) */
 	__u8 drop_vlan_deep;        /* 0/1 — drop frames with > MAX_VLAN_DEPTH tags (default 0) */
 	__u8 drop_udp_frags;        /* 0/1 — drop non-first UDP fragments (default 0) */
+	__u8 reject_with_rst;       /* 0/1 — untrusted side answers enforced TCP drops with a RST
+	                             * to the source instead of a silent drop (default 0), like an
+	                             * iptables REJECT --reject-with tcp-reset. The source may be
+	                             * spoofed, so the RST can land on an unrelated host. */
 	/* NOTE: ttl_* are in coarse ticks (NOW_SHIFT), not seconds — the loader
 	 * converts config seconds -> ticks. */
 	__u32 ttl_syn;              /* SYN_SENT / SYN_RCVD idle timeout */
@@ -165,6 +169,7 @@ struct stats_global {
 	__u64 nonip_pkts, nonip_bytes;   /* non-IPv4 passed through */
 	__u64 nontcp_pkts, nontcp_bytes; /* IPv4 non-TCP passed through */
 	__u64 l1_hits;                   /* L1 flow-cache fast-path forwards */
+	__u64 rst_pkts, rst_bytes;       /* reject_with_rst: RSTs reflected to the source */
 };
 
 struct vlan_stat {

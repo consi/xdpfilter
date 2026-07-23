@@ -32,6 +32,7 @@ It runs on any XDP-capable NIC: Mellanox/NVIDIA ConnectX (`mlx5`), Intel (`ice`,
    inbound   ◄──────────  redirect  ◄─  validate against flow  ◄─  parse  ◄──────────  ◄──────────
    (replies pass)                          │                                            from internet
                                            └─►  no match  ─►  XDP_DROP  (never reaches the host)
+                                                            └─►  or RST ► source  (optional, reject_with_rst)
 ```
 
 One BPF program is loaded twice, once per port, with a compile-time constant marking the port as trusted
@@ -79,6 +80,10 @@ vector is being blocked:
 | **VLAN-stacking evasion** (optional) | more 802.1Q tags than inspected, `drop_vlan_deep` on | `excess VLAN tags` |
 | **Malformed / truncated frames**, wrong IP version | headers do not parse | `malformed` |
 | Flow-table exhaustion under flood | insert failed (observability, not itself an attack) | `flow-table full` |
+
+With `reject_with_rst` on, enforced TCP drops on the untrusted port answer the source with a RST instead
+of dropping silently (see [`reject_with_rst`](#reject_with_rst) below); the per-vector reason counters
+still record what was rejected.
 
 Reflected TCP RST and FIN carry a subtlety: the filter forwards in-state RST/FIN (the protected host
 does its own RFC 5961 sequence validation), but it will **not** let a single spoofed RST/FIN quietly
@@ -175,6 +180,7 @@ drop_frags: true                # drop non-first TCP fragments
 drop_bad_flags: true            # drop null / XMAS / SYN+FIN / SYN+RST / FIN-without-ACK
 drop_udp_frags: false           # also drop non-first UDP fragments
 drop_vlan_deep: false           # drop frames with more 802.1Q tags than are inspected (2)
+reject_with_rst: false          # answer enforced inbound TCP drops with a RST to the source (see note below)
 flow_max: 16777216              # TCP flow table capacity (~128 B/entry: 16M is ~2 GiB)
 udp_flow_max: 4194304           # UDP flow table capacity
 l1_size: 65536                  # per-CPU L1 flow-cache slots (power of two; 0 disables)
@@ -185,10 +191,19 @@ tune: true                      # apply the tuning profile on start
 ```
 
 Policy fields (`mode`, `oos_strict`, `allow_inbound_servers`, `server_allow`, `filter_udp`, `drop_frags`,
-`drop_bad_flags`, `drop_udp_frags`, `drop_vlan_deep`, the TTLs) are applied live when the file changes —
-through inotify, `xdpfilter reload`, or `systemctl reload xdpfilter`. Structural changes (interfaces,
-table sizes, `l1_size`, `lru_percpu`, `xdp_mode`) need a restart, which re-adopts the pinned data path
-without dropping traffic.
+`drop_bad_flags`, `drop_udp_frags`, `drop_vlan_deep`, `reject_with_rst`, the TTLs) are applied live when
+the file changes — through inotify, `xdpfilter reload`, or `systemctl reload xdpfilter`. Structural
+changes (interfaces, table sizes, `l1_size`, `lru_percpu`, `xdp_mode`) need a restart, which re-adopts the
+pinned data path without dropping traffic.
+
+### `reject_with_rst`
+
+Off by default. When on (and in enforce mode), an enforced TCP drop on the untrusted port is answered with
+a RST sent back to the packet's source, instead of a silent drop — the same idea as an iptables
+`REJECT --reject-with tcp-reset` rule, so the sender aborts instead of retransmitting. It only ever acts
+on the internet-facing port; the trusted side never emits anything. Note that inbound source addresses can
+be spoofed, so — like the iptables rule — the RST may be sent to an unrelated host. RSTs emitted show up
+as `rst replies` in `xdpfilter status`.
 
 ## Tuning
 

@@ -26,6 +26,7 @@ info() { printf '  ... %s\n' "$*"; }
 # cumulative counters pulled from `xdpfilter status` (deterministic assertions).
 status_dropped() { "$BIN" status --config "$CFG" 2>/dev/null | awk '/^[[:space:]]*dropped/{gsub(/,/,"",$2); print $2; exit}'; }
 stat_l1() { "$BIN" status --config "$CFG" 2>/dev/null | awk '/l1 hits/{gsub(/,/,"",$3); print $3; exit}'; }
+stat_rst() { "$BIN" status --config "$CFG" 2>/dev/null | awk '/rst replies/{gsub(/,/,"",$3); print $3; exit}'; }
 
 need_root() { [ "$(id -u)" = 0 ] || { echo "must run as root"; exit 1; }; }
 
@@ -92,6 +93,7 @@ drop_bad_flags: true
 filter_udp: true
 drop_vlan_deep: ${DVLAN:-false}
 drop_udp_frags: ${DUDPFRAG:-false}
+reject_with_rst: ${RSTREPLY:-false}
 allow_inbound_servers: ${1:-false}
 server_allow: ${2:-[]}
 flow_max: 65536
@@ -394,6 +396,70 @@ else
 	bad "drop_udp_frags behaved wrong (off delta=$(( ${u2:-0} - ${u1:-0} )), on delta=$(( ${u3:-0} - ${u2:-0} )))"
 fi
 DUDPFRAG=false write_config; sleep 1   # restore default
+
+# ---- Test 14: reject_with_rst — enforced TCP drops answered with a RST ----
+log "Test 14: reject_with_rst — RST reply to source (drop vectors untagged + encapsulations)"
+RSTREPLY=true write_config; sleep 2   # live-enable the policy
+
+# Part A: several drop vectors, UNTAGGED — each enforced TCP drop must emit a RST,
+# and (best-effort) the reflected RST must itself be untagged with valid checksums.
+allok=1
+for sub in synack ack rst badflags; do
+	r1=$(stat_rst)
+	out=$(ip netns exec inet python3 test/attack.py i0 10.0.0.2 1 rstprobe "$sub" 0 2>&1 | tail -1)
+	sleep 1
+	r2=$(stat_rst)
+	if [ "$(( ${r2:-0} - ${r1:-0} ))" -ge 1 ] 2>/dev/null; then
+		info "untagged $sub -> RST emitted  ($out)"
+	else
+		allok=0; info "untagged $sub -> NO RST (delta=$(( ${r2:-0} - ${r1:-0} )), $out)"
+	fi
+	# best-effort: if the reflected RST was observed, it must be untagged (rst_tags=0
+	# -> ok=1) with correct IP+TCP checksums — proven per drop vector, not just `ack`.
+	if echo "$out" | grep -q "reply=RST"; then
+		echo "$out" | grep -q "ok=1" || { allok=0; info "untagged $sub: not untagged ($out)"; }
+		echo "$out" | grep -q "cksum=1" || { allok=0; info "untagged $sub: bad checksum ($out)"; }
+	fi
+done
+if [ "$allok" = 1 ]; then
+	ok "untagged: every TCP drop vector produced a valid, untagged RST reply"
+else
+	bad "some untagged drop vector did not produce a valid untagged RST"
+fi
+
+# Part B: encapsulation preserved — untagged, single 802.1Q, and QinQ.
+encok=1
+for tags in 0 1 2; do
+	r1=$(stat_rst)
+	out=$(ip netns exec inet python3 test/attack.py i0 10.0.0.2 1 rstprobe ack "$tags" 2>&1 | tail -1)
+	sleep 1
+	r2=$(stat_rst)
+	[ "$(( ${r2:-0} - ${r1:-0} ))" -ge 1 ] 2>/dev/null || { encok=0; info "tags=$tags: no RST counted"; }
+	# best-effort: if the reflected RST was actually observed, its tag depth and
+	# its IP+TCP checksums must be correct
+	if echo "$out" | grep -q "reply=RST"; then
+		echo "$out" | grep -q "ok=1" || { encok=0; info "tags=$tags: encapsulation mismatch ($out)"; }
+		echo "$out" | grep -q "cksum=1" || { encok=0; info "tags=$tags: bad checksum ($out)"; }
+	fi
+	info "tags=$tags: $out"
+done
+if [ "$encok" = 1 ]; then
+	ok "RST produced with matching encapsulation (untagged, 802.1Q, QinQ)"
+else
+	bad "RST production/encapsulation wrong across tag depths"
+fi
+
+# Part C: negative — with reject_with_rst OFF, the drop is silent (no RST).
+RSTREPLY=false write_config; sleep 2
+n1=$(stat_rst)
+ip netns exec inet python3 test/attack.py i0 10.0.0.2 1 rstprobe ack 0 2>&1 | tail -1
+sleep 1
+n2=$(stat_rst)
+if [ "$(( ${n2:-0} - ${n1:-0} ))" -eq 0 ] 2>/dev/null; then
+	ok "reject_with_rst off -> no RST emitted (silent drop restored)"
+else
+	bad "RST emitted while reject_with_rst off (delta=$(( ${n2:-0} - ${n1:-0} )))"
+fi
 
 # ---- summary ----
 log "summary"

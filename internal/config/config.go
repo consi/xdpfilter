@@ -35,6 +35,7 @@ type Config struct {
 	FilterUDP           bool     `yaml:"filter_udp"`            // stateful UDP filtering (default true)
 	DropVlanDeep        bool     `yaml:"drop_vlan_deep"`        // drop frames with > 2 VLAN tags (default false)
 	DropUDPFrags        bool     `yaml:"drop_udp_frags"`        // drop non-first UDP fragments (default false)
+	RejectWithRST       bool     `yaml:"reject_with_rst"`       // untrusted side answers enforced TCP drops with a RST to the source (default false)
 
 	// Flow table.
 	FlowMax    uint32 `yaml:"flow_max"`     // TCP LRU capacity (entries)
@@ -83,6 +84,7 @@ func Default() *Config {
 		FilterUDP:        true,
 		DropVlanDeep:     false,
 		DropUDPFrags:     false,
+		RejectWithRST:    false,
 		FlowMax:          1 << 24, // 16M entries ≈ 2 GiB (~128 B/entry)
 		UDPFlowMax:       1 << 22, // 4M entries ≈ 512 MiB
 		L1Size:           1 << 16, // 64K slots/CPU × 24 B ≈ 1.5 MiB/CPU
@@ -219,6 +221,7 @@ func (c *Config) ApplyLiveFrom(src *Config) {
 	c.FilterUDP = src.FilterUDP
 	c.DropVlanDeep = src.DropVlanDeep
 	c.DropUDPFrags = src.DropUDPFrags
+	c.RejectWithRST = src.RejectWithRST
 	c.ServerAllow = src.ServerAllow
 	c.TTLSyn, c.TTLEst, c.TTLClosing, c.TTLUdp = src.TTLSyn, src.TTLEst, src.TTLClosing, src.TTLUdp
 }

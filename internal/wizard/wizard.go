@@ -88,6 +88,7 @@ func Run(cfgPath string) error {
 	}
 	cfg.OosStrict = !promptYN(in, "Adopt pre-existing flows on insertion (recommended for a live network)?", true)
 	cfg.FilterUDP = promptYN(in, "Statefully filter UDP too (drop unsolicited inbound UDP; protects downstream conntrack)?", true)
+	cfg.RejectWithRST = promptYN(in, "Answer dropped inbound TCP with a RST to the source (like iptables REJECT; the source may be spoofed)?", false)
 	if promptYN(in, "Allow inbound connections to servers behind the box (TCP or UDP)?", false) {
 		cfg.AllowInboundServers = true
 		fmt.Println("  Enter allowlisted servers as ip:port (covers TCP+UDP), blank to finish:")
