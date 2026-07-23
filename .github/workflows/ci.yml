@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: generate · vet · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # apt's golang lags go.mod's `go 1.23`, so pin from go.mod via setup-go.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # bpf2go compiles bpf/filter.bpf.c with clang. libbpf-dev provides <bpf/*.h>;
+      # linux-libc-dev provides <linux/bpf.h> and the x86_64 multiarch asm/ headers
+      # that gen.go references (-I/usr/include/x86_64-linux-gnu).
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev
+
+      # Must run before vet/build: the generated filter_bpfel.go //go:embed's
+      # filter_bpfel.o, which is git-ignored and only produced by `go generate`.
+      - name: go generate (bpf2go)
+        run: go generate ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...

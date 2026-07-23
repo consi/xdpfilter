@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create the Release and upload assets with the default GITHUB_TOKEN
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags: required for git log / git describe
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev
+
+      - name: Install nfpm
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest   # pin to a tag for reproducible builds
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Derive VERSION from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"   # v0.0.1 -> 0.0.1
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "building $VERSION from tag $GITHUB_REF_NAME"
+
+      # make deb -> make build -> make generate (clang installed above).
+      # The deb target reads $VERSION and emits xdpfilter_${VERSION}_amd64.deb.
+      - name: Build .deb
+        run: make deb VERSION="$VERSION"
+
+      - name: Generate release notes from commits
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          # Previous release tag reachable from TAG's parent; empty for the first tag.
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="$TAG"   # first tag: every commit reachable from it
+          fi
+          {
+            echo "## xdpfilter ${VERSION}"
+            echo
+            git log --no-merges --pretty='- %s (%h)' "$RANGE"
+          } > NOTES.md
+          cat NOTES.md
+
+      - name: Create GitHub Release + upload .deb
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: xdpfilter ${{ env.VERSION }}
+          body_path: NOTES.md
+          files: xdpfilter_${{ env.VERSION }}_amd64.deb

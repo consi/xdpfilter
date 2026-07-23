@@ -1,0 +1,55 @@
+name: xdpfilter
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: none
+section: net
+priority: optional
+maintainer: "Marek Wajdzik <marek@jest.pro>"
+description: |
+  Transparent bump-in-the-wire XDP filter for spoofed / out-of-state TCP and UDP.
+  Drops SYN-ACK reflection floods, ACK/RST floods and unsolicited UDP before the
+  CPU and before the protected host (keeping them off its conntrack), while
+  passing legitimate traffic at line rate. Keeps its own lockless BPF flow tables
+  (only the trusted side creates state, so an attacker cannot exhaust them).
+  VLAN-transparent (802.1Q / QinQ). Single static binary, first-run wizard,
+  live config reload, per-VLAN stats, auto tuning.
+license: GPL-2.0
+homepage: https://github.com/consi/xdpfilter
+
+# Runtime dependencies. The BPF object is compiled at build time and embedded in
+# the binary, so no compiler/headers are needed on the target — only the tools
+# the daemon actually shells out to.
+depends:
+  - ethtool     # NIC tuning + `ethtool --identify` port blink in the wizard
+  - iproute2    # standard net tooling on the box
+  - systemd     # runs as a Type=notify service and calls systemctl (run/stop/reload/setup)
+recommends:
+  - mstflint   # only for the printed mlxconfig PCIe-ordering recommendation
+suggests:
+  - tcpdump
+
+contents:
+  - src: ./dist/xdpfilter
+    dst: /usr/sbin/xdpfilter
+    file_info:
+      mode: 0755
+  - src: ./packaging/xdpfilter.service
+    dst: /lib/systemd/system/xdpfilter.service
+  - src: ./README.md
+    dst: /usr/share/doc/xdpfilter/README.md
+  - src: ./LICENSE
+    dst: /usr/share/doc/xdpfilter/copyright
+  - dst: /etc/xdpfilter
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /var/lib/xdp_stats
+    type: dir
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh

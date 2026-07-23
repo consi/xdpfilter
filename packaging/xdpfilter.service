@@ -1,0 +1,25 @@
+[Unit]
+Description=xdpfilter — transparent XDP spoofed-TCP filter
+Documentation=file:/usr/share/doc/xdpfilter/README.md
+After=network-online.target
+Wants=network-online.target
+# The datapath is pinned under /sys/fs/bpf, so a daemon restart re-adopts it
+# with no forwarding interruption.
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/xdpfilter daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+WatchdogSec=30
+TimeoutStartSec=30
+User=root
+LimitMEMLOCK=infinity
+KillSignal=SIGTERM
+# A graceful stop (SIGTERM) leaves the transparent bridge attached (via pins).
+# To remove the datapath entirely:  xdpfilter stop --detach
+
+[Install]
+WantedBy=multi-user.target
