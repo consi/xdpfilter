@@ -97,6 +97,14 @@ reject_with_rst: ${RSTREPLY:-false}
 allow_inbound_servers: ${1:-false}
 allow_inbound_syn: ${ALLOWINBOUNDSYN:-false}
 server_allow: ${2:-[]}
+flow_monitoring:
+  enabled: ${FLOWMON:-false}
+  sample_every: ${FLOWSAMPLE:-64}
+  max_flows: 65536
+  cidrs:
+    - cidr: 10.0.0.0/24
+      pps_threshold: ${FLOWPPS:-1000000}
+      mbps_threshold: 0
 flow_max: 65536
 udp_flow_max: 65536
 l1_size: ${L1SIZE:-65536}
@@ -223,6 +231,42 @@ if [ "$(( ${d2:-0} - ${d1:-0} ))" -ge 100 ] 2>/dev/null; then
 else
 	bad "unsolicited UDP not dropped (delta=$(( ${d2:-0} - ${d1:-0} )))"
 fi
+
+# ---- Test 5b: sampled inbound flow monitoring + NDJSON snapshot ----
+log "Test 5b: inbound flow monitoring updates NDJSON every second"
+FLOWMON=true FLOWSAMPLE=1 FLOWPPS=10 write_config false '[]'
+sleep 2 # live reload + clean baseline
+ip netns exec inet python3 -c '
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+for i in range(200): s.sendto(b"x"*100,("10.0.0.2",9998))
+'
+alert_seen=false
+for _ in $(seq 1 30); do
+	if [ -s "$STATS/flow_alerts.jsonl" ]; then alert_seen=true; break; fi
+	sleep 0.1
+done
+if $alert_seen && python3 - "$STATS/flow_alerts.jsonl" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f: row=json.loads(f.readline())
+flow=row["flow"]
+assert row["schema"] == 1 and row["matched_cidr"] == "10.0.0.0/24"
+assert flow["protocol"] == "udp" and flow["protected_ip"] == "10.0.0.2" and flow["protected_port"] == 9998
+assert row["estimated_pps"] > row["threshold_pps"] and "pps" in row["exceeded"]
+PY
+then
+	ok "dropped inbound UDP volume produced a parseable over-threshold tuple"
+else
+	bad "flow alert snapshot missing or invalid"; sed 's/^/    /' "$STATS/flow_alerts.jsonl" 2>/dev/null
+fi
+clean_seen=false
+for _ in $(seq 1 30); do
+	if [ -f "$STATS/flow_alerts.jsonl" ] && [ ! -s "$STATS/flow_alerts.jsonl" ]; then clean_seen=true; break; fi
+	sleep 0.1
+done
+$clean_seen && ok "flow left the snapshot after the next clean window" || bad "flow alert did not clear"
+write_config false '[]'
+sleep 1
 
 # ---- Test 6: resilience — datapath survives daemon kill ----
 log "Test 6: datapath survives daemon crash (pinned links)"

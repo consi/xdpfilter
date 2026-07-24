@@ -18,11 +18,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
-	"golang.org/x/sys/unix"
 
 	"github.com/consi/xdpfilter/internal/config"
 )
@@ -31,6 +31,10 @@ import (
 // bpf_ktime_get_coarse_ns >> nowShift (1 tick ≈ 1.073741824 s). TTLs written to
 // the features map and the GC clock are all in these ticks.
 const nowShift = 30
+
+// BPF_F_NO_COMMON_LRU is Linux UAPI bit 1. Keep the numeric value local so the
+// control plane and its unit tests also compile on non-Linux development hosts.
+const bpfFNoCommonLRU = 1 << 1
 
 // secToTicks converts a TTL in seconds to coarse ticks, rounding up so a
 // positive TTL never collapses to zero.
@@ -50,22 +54,27 @@ func secToTicks(sec uint32) uint32 {
 // l1cache is shared so a flow's two directions (which normalize to the same key)
 // hit the same per-CPU slot when symmetric RSS lands them on one CPU.
 var sharedMapNames = []string{
-	"flows", "udp_flows", "l1cache", "tx_ports", "features", "server_allow",
+	"flows", "udp_flows", "flow_monitor_cidrs", "flow_monitor_counters", "l1cache", "tx_ports", "features", "server_allow",
 	"synbkt", "drop_reason", "stats_global", "stats_vlan",
 }
 
+const runtimeMapName = "runtime_state"
+
 // SharedMaps holds the maps shared between the two program instances.
 type SharedMaps struct {
-	Flows       *ebpf.Map
-	UDPFlows    *ebpf.Map
-	L1Cache     *ebpf.Map
-	TxPorts     *ebpf.Map
-	Features    *ebpf.Map
-	ServerAllow *ebpf.Map
-	SynBkt      *ebpf.Map
-	DropReason  *ebpf.Map
-	StatsGlobal *ebpf.Map
-	StatsVlan   *ebpf.Map
+	Flows               *ebpf.Map
+	UDPFlows            *ebpf.Map
+	FlowMonitorCIDRs    *ebpf.Map
+	FlowMonitorCounters *ebpf.Map
+	L1Cache             *ebpf.Map
+	TxPorts             *ebpf.Map
+	Features            *ebpf.Map
+	ServerAllow         *ebpf.Map
+	SynBkt              *ebpf.Map
+	DropReason          *ebpf.Map
+	StatsGlobal         *ebpf.Map
+	StatsVlan           *ebpf.Map
+	Runtime             *ebpf.Map
 
 	byName map[string]*ebpf.Map
 }
@@ -105,6 +114,32 @@ type featuresValue struct {
 	TTLEst     uint32
 	TTLClosing uint32
 	TTLUdp     uint32
+}
+
+// LivePolicy is the policy currently active in the BPF features map.
+type LivePolicy struct {
+	Mode                string
+	OosStrict           bool
+	AllowInboundServers bool
+	AllowInboundSYN     bool
+	DropFrags           bool
+	DropBadFlags        bool
+	FilterUDP           bool
+	DropVlanDeep        bool
+	DropUDPFrags        bool
+	RejectWithRST       bool
+	TTLSyn              uint32
+	TTLEst              uint32
+	TTLClosing          uint32
+	TTLUdp              uint32
+}
+
+// RuntimeState is userspace-published daemon state stored alongside BPF pins.
+type RuntimeState struct {
+	TCPLive             uint64
+	UDPLive             uint64
+	LastGCUnixNano      int64
+	DaemonStartUnixNano int64
 }
 
 func featuresFrom(cfg *config.Config) featuresValue {
@@ -170,6 +205,13 @@ func Load(cfg *config.Config) (*Handle, error) {
 	}
 	spec.Maps["flows"].MaxEntries = cfg.FlowMax
 	spec.Maps["udp_flows"].MaxEntries = cfg.UDPFlowMax
+	spec.Maps["flow_monitor_counters"].MaxEntries = cfg.FlowMonitoring.MaxFlows
+	if err := setVar(spec, "FLOW_MONITOR_ENABLED", boolU32(cfg.FlowMonitoring.Enabled)); err != nil {
+		return nil, err
+	}
+	if err := setVar(spec, "FLOW_MONITOR_SAMPLE_MASK", cfg.FlowMonitoring.SampleEvery-1); err != nil {
+		return nil, err
+	}
 
 	// L1 cache sizing: a PERCPU_ARRAY needs >= 1 entry even when disabled, so a
 	// zero l1_size maps to a 1-entry map plus L1_MASK=0 (which dead-code-eliminates
@@ -184,8 +226,8 @@ func Load(cfg *config.Config) (*Handle, error) {
 	// Optional per-CPU LRU (BPF_F_NO_COMMON_LRU): trades global capacity for zero
 	// cross-CPU contention on the insert path under high connection churn.
 	if cfg.LRUPerCPU {
-		spec.Maps["flows"].Flags |= unix.BPF_F_NO_COMMON_LRU
-		spec.Maps["udp_flows"].Flags |= unix.BPF_F_NO_COMMON_LRU
+		spec.Maps["flows"].Flags |= bpfFNoCommonLRU
+		spec.Maps["udp_flows"].Flags |= bpfFNoCommonLRU
 	}
 
 	// Byte accounting for multi-buffer (jumbo) frames costs a helper call, so only
@@ -200,6 +242,7 @@ func Load(cfg *config.Config) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
+	_ = PublishRuntimeState(shared, RuntimeState{DaemonStartUnixNano: time.Now().UnixNano()})
 
 	// Populate control maps before attach so the first packet sees real policy.
 	if err := shared.TxPorts.Put(uint32(0), uint32(ifT.Index)); err != nil {
@@ -217,6 +260,10 @@ func Load(cfg *config.Config) (*Handle, error) {
 	// Sync (not just add) so entries removed from config don't linger in a pinned
 	// map adopted from a previous run.
 	if err := SyncServerAllow(shared, cfg); err != nil {
+		shared.Close()
+		return nil, err
+	}
+	if err := SyncFlowMonitorCIDRs(shared, cfg); err != nil {
 		shared.Close()
 		return nil, err
 	}
@@ -265,6 +312,12 @@ func loadProg(spec *ebpf.CollectionSpec, shared *SharedMaps, roleTrusted uint8, 
 	if err := setVar(s, "ROLE_TRUSTED", roleTrusted); err != nil {
 		return nil, nil, err
 	}
+	if roleTrusted != 0 {
+		// The protected-side program never performs inbound flow monitoring.
+		if err := setVar(s, "FLOW_MONITOR_ENABLED", uint32(0)); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := setVar(s, "PEER_IDX", peerIdx); err != nil {
 		return nil, nil, err
 	}
@@ -276,8 +329,12 @@ func loadProg(spec *ebpf.CollectionSpec, shared *SharedMaps, roleTrusted uint8, 
 	if err := setVar(s, "MULTIBUF", multibuf); err != nil {
 		return nil, nil, err
 	}
+	replacements := make(map[string]*ebpf.Map, len(sharedMapNames))
+	for _, name := range sharedMapNames {
+		replacements[name] = shared.byName[name]
+	}
 	coll, err := ebpf.NewCollectionWithOptions(s, ebpf.CollectionOptions{
-		MapReplacements: shared.byName,
+		MapReplacements: replacements,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -359,18 +416,29 @@ func createOrAdoptShared(pinDir string, spec *ebpf.CollectionSpec) (*SharedMaps,
 		}
 		byName[name] = m
 	}
+	runtime, err := adoptOrCreateMap(pinDir, runtimeMapName, &ebpf.MapSpec{
+		Name: runtimeMapName, Type: ebpf.Array, KeySize: 4,
+		ValueSize: uint32(binary.Size(RuntimeState{})), MaxEntries: 1,
+	})
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("map %q: %w", runtimeMapName, err)
+	}
+	byName[runtimeMapName] = runtime
 	return &SharedMaps{
-		Flows:       byName["flows"],
-		UDPFlows:    byName["udp_flows"],
-		L1Cache:     byName["l1cache"],
-		TxPorts:     byName["tx_ports"],
-		Features:    byName["features"],
-		ServerAllow: byName["server_allow"],
-		SynBkt:      byName["synbkt"],
-		DropReason:  byName["drop_reason"],
-		StatsGlobal: byName["stats_global"],
-		StatsVlan:   byName["stats_vlan"],
-		byName:      byName,
+		Flows:               byName["flows"],
+		UDPFlows:            byName["udp_flows"],
+		FlowMonitorCIDRs:    byName["flow_monitor_cidrs"],
+		FlowMonitorCounters: byName["flow_monitor_counters"],
+		L1Cache:             byName["l1cache"],
+		TxPorts:             byName["tx_ports"],
+		Features:            byName["features"],
+		ServerAllow:         byName["server_allow"],
+		SynBkt:              byName["synbkt"],
+		DropReason:          byName["drop_reason"],
+		StatsGlobal:         byName["stats_global"],
+		StatsVlan:           byName["stats_vlan"], Runtime: byName[runtimeMapName],
+		byName: byName,
 	}, nil
 }
 
@@ -450,6 +518,49 @@ func SyncServerAllow(s *SharedMaps, cfg *config.Config) error {
 	return nil
 }
 
+// SyncFlowMonitorCIDRs reconciles the LPM membership trie. Thresholds remain
+// in userspace; the datapath only needs to know whether a protected IP belongs
+// to at least one configured network before allocating/updating a counter.
+func SyncFlowMonitorCIDRs(s *SharedMaps, cfg *config.Config) error {
+	desired := make(map[[8]byte]struct{}, len(cfg.FlowMonitoring.CIDRs))
+	for _, rule := range cfg.FlowMonitoring.CIDRs {
+		ip, network, err := net.ParseCIDR(rule.CIDR)
+		if err != nil || ip.To4() == nil {
+			return fmt.Errorf("flow monitor CIDR %q is invalid", rule.CIDR)
+		}
+		ones, _ := network.Mask.Size()
+		var key [8]byte
+		binary.NativeEndian.PutUint32(key[:4], uint32(ones))
+		copy(key[4:], network.IP.To4())
+		desired[key] = struct{}{}
+	}
+
+	var cur [8]byte
+	var val uint8
+	var stale [][8]byte
+	it := s.FlowMonitorCIDRs.Iterate()
+	for it.Next(&cur, &val) {
+		if _, ok := desired[cur]; !ok {
+			stale = append(stale, cur)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return fmt.Errorf("iterate flow_monitor_cidrs: %w", err)
+	}
+	for _, key := range stale {
+		if err := s.FlowMonitorCIDRs.Delete(key[:]); err != nil {
+			return fmt.Errorf("flow_monitor_cidrs delete: %w", err)
+		}
+	}
+	for key := range desired {
+		k := key
+		if err := s.FlowMonitorCIDRs.Put(k[:], uint8(1)); err != nil {
+			return fmt.Errorf("flow_monitor_cidrs put: %w", err)
+		}
+	}
+	return nil
+}
+
 // ReloadPolicy re-applies the live-updatable policy (feature toggles, TTLs and
 // the server allowlist) to the maps. No reattach — the datapath and flow tables
 // are untouched. Used by SIGHUP / inotify config reload.
@@ -457,7 +568,49 @@ func ReloadPolicy(s *SharedMaps, cfg *config.Config) error {
 	if err := ApplyFeatures(s, cfg); err != nil {
 		return err
 	}
-	return SyncServerAllow(s, cfg)
+	if err := SyncServerAllow(s, cfg); err != nil {
+		return err
+	}
+	return SyncFlowMonitorCIDRs(s, cfg)
+}
+
+func boolU32(v bool) uint32 {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// ApplyFlowMonitorControl updates only the untrusted program. The trusted
+// program is load-time specialized with ROLE_TRUSTED and never executes the
+// monitoring path. Disabling is written first; enabling writes the sampling
+// mask first so no packet observes an old sampling factor.
+func (h *Handle) ApplyFlowMonitorControl(cfg *config.Config) error {
+	if h == nil || h.collU == nil {
+		return errors.New("flow monitor program unavailable")
+	}
+	enabled := boolU32(cfg.FlowMonitoring.Enabled)
+	set := func(coll *ebpf.Collection, name string, value uint32) error {
+		v := coll.Variables[name]
+		if v == nil {
+			return fmt.Errorf("BPF variable %s unavailable", name)
+		}
+		return v.Set(value)
+	}
+	if enabled == 0 {
+		if err := set(h.collU, "FLOW_MONITOR_ENABLED", uint32(0)); err != nil {
+			return err
+		}
+	}
+	if err := set(h.collU, "FLOW_MONITOR_SAMPLE_MASK", cfg.FlowMonitoring.SampleEvery-1); err != nil {
+		return err
+	}
+	if enabled != 0 {
+		if err := set(h.collU, "FLOW_MONITOR_ENABLED", enabled); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close releases fds but leaves the datapath attached (pins persist), so a
@@ -492,7 +645,7 @@ func Detach(pinDir string) error {
 		}
 		_ = os.Remove(p)
 	}
-	for _, name := range sharedMapNames {
+	for _, name := range append(append([]string(nil), sharedMapNames...), runtimeMapName) {
 		p := filepath.Join(pinDir, name)
 		if m, err := ebpf.LoadPinnedMap(p, nil); err == nil {
 			_ = m.Unpin()
@@ -518,24 +671,68 @@ func OpenPinned(pinDir string) (*SharedMaps, error) {
 		}
 		byName[name] = m
 	}
+	// Optional for compatibility with a daemon started before runtime_state was added.
+	if m, err := ebpf.LoadPinnedMap(filepath.Join(pinDir, runtimeMapName), nil); err == nil {
+		byName[runtimeMapName] = m
+	}
 	return &SharedMaps{
 		Flows: byName["flows"], UDPFlows: byName["udp_flows"], L1Cache: byName["l1cache"],
+		FlowMonitorCIDRs: byName["flow_monitor_cidrs"], FlowMonitorCounters: byName["flow_monitor_counters"],
 		TxPorts: byName["tx_ports"], Features: byName["features"],
 		ServerAllow: byName["server_allow"], SynBkt: byName["synbkt"], DropReason: byName["drop_reason"],
-		StatsGlobal: byName["stats_global"], StatsVlan: byName["stats_vlan"], byName: byName,
+		StatsGlobal: byName["stats_global"], StatsVlan: byName["stats_vlan"],
+		Runtime: byName[runtimeMapName], byName: byName,
 	}, nil
+}
+
+// ReadLivePolicy returns the feature values currently active in the datapath.
+func ReadLivePolicy(s *SharedMaps) (LivePolicy, error) {
+	var fv featuresValue
+	if err := s.Features.Lookup(uint32(0), &fv); err != nil {
+		return LivePolicy{}, fmt.Errorf("read features: %w", err)
+	}
+	b := func(v uint8) bool { return v != 0 }
+	mode := "monitor"
+	if fv.Mode == 1 {
+		mode = "enforce"
+	}
+	return LivePolicy{
+		Mode: mode, OosStrict: b(fv.OosStrict),
+		AllowInboundServers: b(fv.AllowInboundServers), AllowInboundSYN: b(fv.AllowInboundSYN),
+		DropFrags: b(fv.DropFrags), DropBadFlags: b(fv.DropBadFlags), FilterUDP: b(fv.FilterUDP),
+		DropVlanDeep: b(fv.DropVlanDeep), DropUDPFrags: b(fv.DropUDPFrags), RejectWithRST: b(fv.RejectWithRST),
+		TTLSyn: ticksToSec(fv.TTLSyn), TTLEst: ticksToSec(fv.TTLEst),
+		TTLClosing: ticksToSec(fv.TTLClosing), TTLUdp: ticksToSec(fv.TTLUdp),
+	}, nil
+}
+
+// PublishRuntimeState updates the optional userspace runtime map.
+func PublishRuntimeState(s *SharedMaps, state RuntimeState) error {
+	if s == nil || s.Runtime == nil {
+		return nil
+	}
+	return s.Runtime.Put(uint32(0), &state)
+}
+
+// ReadRuntimeState reads flow occupancy and daemon timestamps.
+func ReadRuntimeState(s *SharedMaps) (RuntimeState, error) {
+	if s == nil || s.Runtime == nil {
+		return RuntimeState{}, errors.New("runtime state unavailable")
+	}
+	var state RuntimeState
+	if err := s.Runtime.Lookup(uint32(0), &state); err != nil {
+		return state, err
+	}
+	return state, nil
 }
 
 // Mode returns the current datapath mode ("monitor"/"enforce") from the features map.
 func Mode(s *SharedMaps) string {
-	var fv featuresValue
-	if err := s.Features.Lookup(uint32(0), &fv); err != nil {
+	p, err := ReadLivePolicy(s)
+	if err != nil {
 		return "unknown"
 	}
-	if fv.Mode == 1 {
-		return "enforce"
-	}
-	return "monitor"
+	return p.Mode
 }
 
 // SetModePinned flips monitor/enforce on a running instance without reattaching.

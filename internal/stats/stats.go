@@ -36,6 +36,30 @@ var reasonLabels = []string{
 
 const numReasons = 13
 
+// ReasonLabels returns a copy of the stable drop-reason labels.
+func ReasonLabels() []string { return append([]string(nil), reasonLabels...) }
+
+// GlobalCounters is the public aggregate used by interactive clients.
+type GlobalCounters struct {
+	RxPkts, RxBytes, RedirPkts, RedirBytes, DropPkts, DropBytes uint64
+	NonIPPkts, NonIPBytes, NonTCPPkts, NonTCPBytes              uint64
+	L1Hits, RstPkts, RstBytes                                   uint64
+}
+
+// VLANCounters is one summed per-VLAN reading.
+type VLANCounters struct{ Pkts, Bytes, Drops uint64 }
+
+// RateSample contains totals and per-second deltas between two snapshots.
+type RateSample struct {
+	When                                                   time.Time
+	Totals                                                 GlobalCounters
+	ProcessedPPS, RedirectedPPS, DroppedPPS, L1PPS, RstPPS float64
+	ProcessedBPS, RedirectedBPS, DroppedBPS                float64
+	ReasonPPS                                              []float64
+	VLANPPS                                                map[uint16]float64
+	VLANDropPPS                                            map[uint16]float64
+}
+
 type statsGlobalValue struct {
 	RxPkts, RxBytes         uint64
 	RedirPkts, RedirBytes   uint64
@@ -56,6 +80,42 @@ type Snapshot struct {
 	Reasons [numReasons]uint64
 	Vlans   map[uint16]vlanStatValue
 	When    time.Time
+}
+
+// Rates converts a current snapshot and optional previous snapshot into a
+// display sample. Counter resets are treated as a fresh baseline, never as
+// uint64 underflow.
+func Rates(prev *Snapshot, cur Snapshot) RateSample {
+	g := cur.G
+	out := RateSample{When: cur.When, Totals: GlobalCounters{
+		RxPkts: g.RxPkts, RxBytes: g.RxBytes, RedirPkts: g.RedirPkts, RedirBytes: g.RedirBytes,
+		DropPkts: g.DropPkts, DropBytes: g.DropBytes, NonIPPkts: g.NonIPPkts, NonIPBytes: g.NonIPBytes,
+		NonTCPPkts: g.NonTCPPkts, NonTCPBytes: g.NonTCPBytes, L1Hits: g.L1Hits, RstPkts: g.RstPkts, RstBytes: g.RstBytes,
+	}, ReasonPPS: make([]float64, numReasons), VLANPPS: map[uint16]float64{}, VLANDropPPS: map[uint16]float64{}}
+	if prev == nil {
+		return out
+	}
+	secs := cur.When.Sub(prev.When).Seconds()
+	if secs <= 0 {
+		return out
+	}
+	d := func(n, old uint64) float64 {
+		if n < old {
+			return 0
+		}
+		return float64(n-old) / secs
+	}
+	out.ProcessedPPS, out.RedirectedPPS, out.DroppedPPS = d(g.RxPkts, prev.G.RxPkts), d(g.RedirPkts, prev.G.RedirPkts), d(g.DropPkts, prev.G.DropPkts)
+	out.L1PPS, out.RstPPS = d(g.L1Hits, prev.G.L1Hits), d(g.RstPkts, prev.G.RstPkts)
+	out.ProcessedBPS, out.RedirectedBPS, out.DroppedBPS = 8*d(g.RxBytes, prev.G.RxBytes), 8*d(g.RedirBytes, prev.G.RedirBytes), 8*d(g.DropBytes, prev.G.DropBytes)
+	for i := range out.ReasonPPS {
+		out.ReasonPPS[i] = d(cur.Reasons[i], prev.Reasons[i])
+	}
+	for vid, v := range cur.Vlans {
+		pv := prev.Vlans[vid]
+		out.VLANPPS[vid], out.VLANDropPPS[vid] = d(v.Pkts, pv.Pkts), d(v.Drops, pv.Drops)
+	}
+	return out
 }
 
 // Collect sums every per-CPU counter into a Snapshot.

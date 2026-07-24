@@ -31,6 +31,8 @@ import (
 
 	"github.com/consi/xdpfilter/internal/config"
 	"github.com/consi/xdpfilter/internal/dataplane"
+	"github.com/consi/xdpfilter/internal/flowmonitor"
+	"github.com/consi/xdpfilter/internal/manage"
 	"github.com/consi/xdpfilter/internal/meta"
 	"github.com/consi/xdpfilter/internal/stats"
 	"github.com/consi/xdpfilter/internal/tuning"
@@ -62,6 +64,8 @@ func main() {
 		err = cmdMode(os.Args[2:])
 	case "flows":
 		err = cmdFlows(os.Args[2:])
+	case "manage":
+		err = cmdManage(os.Args[2:])
 	case "tune":
 		err = cmdTune(os.Args[2:])
 	case "check":
@@ -90,12 +94,22 @@ usage:
   xdpfilter reload                reload config live (allowlist / policy / TTLs)
   xdpfilter mode monitor|enforce  flip mode live (no reattach)
   xdpfilter flows [--limit N]     sample the flow table
+  xdpfilter manage [--config P]   interactive operations console
   xdpfilter tune [--dry-run]      apply/preview performance tuning
   xdpfilter check                 preflight the environment
   xdpfilter stop [--detach] [--restore] [--yes]
   xdpfilter version
 `)
 	fmt.Fprintf(os.Stderr, "\n%s\n", meta.Copyright)
+}
+
+func cmdManage(args []string) error {
+	fs := flag.NewFlagSet("manage", flag.ExitOnError)
+	path := fs.String("config", config.DefaultPath, "config file path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return manage.Run(*path, version)
 }
 
 func loadCfg(fs *flag.FlagSet, args []string) (*config.Config, error) {
@@ -178,6 +192,7 @@ func cmdDaemon(args []string) error {
 	}
 	ports := fmt.Sprintf("%s (trusted) <-> %s (untrusted)", cfg.TrustedIface, cfg.UntrustedIface)
 	reporter := stats.NewReporter(version, cfg.StatsDir, ports, occ)
+	flowReporter := flowmonitor.NewReporter(cfg.StatsDir)
 
 	// Workers are tracked in a WaitGroup so shutdown waits for them to stop
 	// before the deferred h.Close frees the maps they read.
@@ -193,6 +208,9 @@ func cmdDaemon(args []string) error {
 		lt, _ := dataplane.GCOnce(h.Maps.Flows, c)
 		lu, _ := dataplane.GCOnce(h.Maps.UDPFlows, c)
 		atomic.StoreInt64(&live, int64(lt+lu))
+		rs, _ := dataplane.ReadRuntimeState(h.Maps)
+		rs.TCPLive, rs.UDPLive, rs.LastGCUnixNano = uint64(lt), uint64(lu), time.Now().UnixNano()
+		_ = dataplane.PublishRuntimeState(h.Maps, rs)
 	})
 
 	// Stats.
@@ -203,6 +221,14 @@ func cmdDaemon(args []string) error {
 		}
 		if warn != "" {
 			log.Printf("ALERT %s", warn)
+		}
+	})
+
+	// Sampled flow-volume alerts have a fixed one-second contract independent
+	// of the human-readable stats interval.
+	spawn(time.Second, func() {
+		if _, err := flowReporter.Tick(h.Maps, cfgPtr.Load()); err != nil {
+			log.Printf("flow monitoring: %v", err)
 		}
 	})
 
@@ -225,15 +251,33 @@ func cmdDaemon(args []string) error {
 		if d := cur.StructuralDiff(newCfg); d != "" {
 			log.Printf("reload: %s changed — needs a restart; applying live subset only", d)
 		}
-		merged := *cur // snapshot; publish atomically before touching the maps
+		merged := *cur
 		merged.ApplyLiveFrom(newCfg)
-		cfgPtr.Store(&merged)
+		// Turn accounting off before removing CIDRs. For enabling, populate the
+		// trie first and flip the untrusted program's global last.
+		if !merged.FlowMonitoring.Enabled {
+			if err := h.ApplyFlowMonitorControl(&merged); err != nil {
+				log.Printf("reload: flow monitoring: %v", err)
+				return
+			}
+		}
 		if err := dataplane.ReloadPolicy(h.Maps, &merged); err != nil {
+			_ = h.ApplyFlowMonitorControl(cur)
 			log.Printf("reload: %v", err)
 			return
 		}
-		log.Printf("reload: applied — mode=%s, filter_udp=%v, allow_inbound_syn=%v, allowlist=%d servers",
-			merged.Mode, merged.FilterUDP, merged.AllowInboundSYN, len(merged.ServerAllow))
+		if merged.FlowMonitoring.Enabled {
+			if err := h.ApplyFlowMonitorControl(&merged); err != nil {
+				_ = dataplane.ReloadPolicy(h.Maps, cur)
+				_ = h.ApplyFlowMonitorControl(cur)
+				log.Printf("reload: flow monitoring: %v", err)
+				return
+			}
+		}
+		cfgPtr.Store(&merged)
+		log.Printf("reload: applied — mode=%s, filter_udp=%v, allow_inbound_syn=%v, allowlist=%d servers, flow_monitoring=%v rules=%d sample=1/%d",
+			merged.Mode, merged.FilterUDP, merged.AllowInboundSYN, len(merged.ServerAllow),
+			merged.FlowMonitoring.Enabled, len(merged.FlowMonitoring.CIDRs), merged.FlowMonitoring.SampleEvery)
 	}
 
 	reloadCh := make(chan struct{}, 1)

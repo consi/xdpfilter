@@ -131,6 +131,38 @@ func Run(cfgPath string) error {
 		rec.L1Size, func(v uint32) bool { return v == 0 || (v >= 1024 && v&(v-1) == 0) })
 	fmt.Println("-- end sizing --")
 
+	// Optional sampled inbound flow monitoring.
+	if promptYN(in, "Enable sampled inbound flow monitoring?", false) {
+		cfg.FlowMonitoring.Enabled = true
+		cfg.FlowMonitoring.SampleEvery = promptU32(in, "Monitor one in every N inbound TCP/UDP packets (power of two)",
+			cfg.FlowMonitoring.SampleEvery, func(v uint32) bool { return v > 0 && v <= 65536 && v&(v-1) == 0 })
+		cfg.FlowMonitoring.MaxFlows = promptU32(in, "Sampled flow counter capacity",
+			cfg.FlowMonitoring.MaxFlows, func(v uint32) bool { return v >= 1024 && v <= 1<<20 })
+		fmt.Println("  Enter protected IPv4 CIDRs and per-flow thresholds; blank CIDR finishes.")
+		for len(cfg.FlowMonitoring.CIDRs) < 4096 {
+			cidr := prompt(in, "  CIDR", "")
+			if cidr == "" {
+				break
+			}
+			ip, network, err := net.ParseCIDR(cidr)
+			if err != nil || ip.To4() == nil || network.String() != cidr {
+				fmt.Println("    invalid: use a canonical IPv4 CIDR such as 10.0.0.0/24")
+				continue
+			}
+			ppsText := prompt(in, "    PPS threshold (0 disables)", "0")
+			mbpsText := prompt(in, "    Mbps threshold (0 disables)", "0")
+			pps, ppsErr := strconv.ParseUint(ppsText, 10, 64)
+			mbps, mbpsErr := strconv.ParseFloat(mbpsText, 64)
+			if ppsErr != nil || mbpsErr != nil || mbps < 0 || (pps == 0 && mbps == 0) {
+				fmt.Println("    invalid: configure at least one non-negative threshold")
+				continue
+			}
+			cfg.FlowMonitoring.CIDRs = append(cfg.FlowMonitoring.CIDRs, config.FlowMonitorCIDR{
+				CIDR: cidr, PPSThreshold: pps, MbpsThreshold: mbps,
+			})
+		}
+	}
+
 	// Tuning preview.
 	if promptYN(in, "Apply performance tuning (sysctls, NIC, IRQ pinning) on start?", true) {
 		cfg.Tune = true
@@ -165,6 +197,9 @@ func Run(cfgPath string) error {
 			return fmt.Errorf("systemctl start: %w", err)
 		}
 		fmt.Println("Started. Watch:  xdpfilter status   |   cat", filepath.Join(cfg.StatsDir, "stats.txt"))
+		if cfg.FlowMonitoring.Enabled {
+			fmt.Println("Flow alerts: cat", filepath.Join(cfg.StatsDir, "flow_alerts.jsonl"))
+		}
 		if cfg.Mode == "monitor" {
 			fmt.Println("Running in MONITOR mode — verify only attack traffic is flagged, then:  xdpfilter mode enforce")
 		}

@@ -41,6 +41,11 @@ volatile const __u32 PEER_IDX = 0;     /* tx_ports index of the *other* port */
 volatile const __u32 L1_MASK = 0;      /* l1cache size-1 (power-of-two); 0 disables the L1 fast path */
 volatile const __u8 MULTIBUF = 0;      /* 1 => use bpf_xdp_get_buff_len for byte accounting (jumbo/multi-buf) */
 
+/* Mutable at runtime through the collection's mmapable data maps. Disabled
+ * monitoring returns before the PRNG helper or either monitoring map lookup. */
+volatile __u32 FLOW_MONITOR_ENABLED;
+volatile __u32 FLOW_MONITOR_SAMPLE_MASK = 63; /* sample_every-1 */
+
 /* ---- on-wire headers (self-contained; avoids <linux/ip.h> bitfield quirks) ---- */
 struct ethhdr {
 	__u8 dest[ETH_ALEN];
@@ -99,6 +104,21 @@ struct {
 	__type(value, struct flow_val);
 	__uint(max_entries, 1 << 20);        /* default; Go overrides from config.udp_flow_max */
 } udp_flows SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct flow_cidr_key);
+	__type(value, __u8);
+	__uint(max_entries, 4096);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} flow_monitor_cidrs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct flow_monitor_key);
+	__type(value, struct flow_counter);
+	__uint(max_entries, 1 << 18); /* Go overrides from flow_monitoring.max_flows */
+} flow_monitor_counters SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); /* per-CPU L1 flow cache (direct-mapped) */
@@ -171,6 +191,42 @@ static __always_inline struct features *get_features(void)
 {
 	__u32 z = 0;
 	return bpf_map_lookup_elem(&features, &z);
+}
+
+/* Account a small random sample of inbound TCP/UDP packets. Callers invoke this
+ * only after their already-required port-role check selected the untrusted
+ * side. Only the sampled 1/N packets touch the LPM and shared LRU maps. */
+static __always_inline void monitor_flow(const struct flow_key *k, __u8 protocol, __u64 len)
+{
+	if (!FLOW_MONITOR_ENABLED)
+		return;
+	if (bpf_get_prandom_u32() & FLOW_MONITOR_SAMPLE_MASK)
+		return;
+
+	struct flow_cidr_key ck = {
+		.prefixlen = 32,
+		.addr = k->host_ip,
+	};
+	__u8 *matched = bpf_map_lookup_elem(&flow_monitor_cidrs, &ck);
+	if (!matched)
+		return;
+
+	struct flow_monitor_key mk = {.flow = *k, .protocol = protocol};
+	struct flow_counter *v = bpf_map_lookup_elem(&flow_monitor_counters, &mk);
+	if (v) {
+		__sync_fetch_and_add(&v->packets, 1);
+		__sync_fetch_and_add(&v->bytes, len);
+		return;
+	}
+	struct flow_counter fresh = {.packets = 1, .bytes = len};
+	if (bpf_map_update_elem(&flow_monitor_counters, &mk, &fresh, BPF_NOEXIST)) {
+		/* A racing CPU may have inserted the same tuple. Preserve this sample. */
+		v = bpf_map_lookup_elem(&flow_monitor_counters, &mk);
+		if (v) {
+			__sync_fetch_and_add(&v->packets, 1);
+			__sync_fetch_and_add(&v->bytes, len);
+		}
+	}
 }
 
 static __noinline void stat_reason(__u32 reason)
@@ -880,8 +936,6 @@ int xdp_filter(struct xdp_md *ctx)
 			f = get_features();
 			if (!f)
 				return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
-			if (f->drop_bad_flags && unlikely(bad_flags(flags)))
-				return do_drop_tcp(ctx, f, g, vs, RSN_BAD_FLAGS, len, eth, ip, tcp);
 		}
 
 		/* normalized, direction-independent key (aligned(8) so flow_key_eq's
@@ -899,6 +953,10 @@ int xdp_filter(struct xdp_md *ctx)
 			k.inet_port = tcp->source;
 			k.host_port = tcp->dest;
 		}
+		if (!trusted)
+			monitor_flow(&k, IPPROTO_TCP, len);
+		if (f && f->drop_bad_flags && unlikely(bad_flags(flags)))
+			return do_drop_tcp(ctx, f, g, vs, RSN_BAD_FLAGS, len, eth, ip, tcp);
 
 		__u32 now = now_tick();
 
@@ -941,22 +999,28 @@ int xdp_filter(struct xdp_md *ctx)
 		struct features *f = get_features();
 		if (!f)
 			return bpf_redirect_map(&tx_ports, PEER_IDX, 0);
-		if (!f->filter_udp)
-			goto nontcp;
 
 		/* a non-first fragment has no L4 ports — can't key it; policy decides */
 		if (unlikely(ip->frag_off & bpf_htons(IP_FRAG_OFF_MASK))) {
+			if (!f->filter_udp)
+				goto nontcp;
 			if (f->drop_udp_frags)
 				return do_drop(f, g, vs, RSN_UDP_FRAG, len);
 			return do_forward(g, len);
 		}
 		struct udphdr_min *udp = l4;
-		if (unlikely((void *)(udp + 1) > data_end))
+		if (unlikely((void *)(udp + 1) > data_end)) {
+			if (!f->filter_udp)
+				goto nontcp;
 			return do_drop(f, g, vs, RSN_MALFORMED, len);
+		}
 		/* tot_len must reach past IP options + the 8-byte UDP header (padding /
 		 * tiny-first-fragment guard; in-header fields only) */
-		if (unlikely(bpf_ntohs(ip->tot_len) < ihl + sizeof(*udp)))
+		if (unlikely(bpf_ntohs(ip->tot_len) < ihl + sizeof(*udp))) {
+			if (!f->filter_udp)
+				goto nontcp;
 			return do_drop(f, g, vs, RSN_MALFORMED, len);
+		}
 		struct flow_key uk __attribute__((aligned(8))) = {};
 		__u8 trusted = ROLE_TRUSTED;
 		uk.vlans = ((__u32)outer_vid << 12) | inner_vid;
@@ -971,6 +1035,10 @@ int xdp_filter(struct xdp_md *ctx)
 			uk.inet_port = udp->source;
 			uk.host_port = udp->dest;
 		}
+		if (!trusted)
+			monitor_flow(&uk, IPPROTO_UDP, len);
+		if (!f->filter_udp)
+			goto nontcp;
 
 		/* L1 fast path for established UDP pseudo-flows */
 		__u32 l1_idx = 0;

@@ -129,6 +129,7 @@ the service on boot and start it. It defaults to monitor mode.
 ```sh
 xdpfilter status                 # live counters, mode, occupancy
 xdpfilter mode enforce           # start dropping, no reattach
+xdpfilter manage                 # interactive dashboard and configuration console
 cat /var/lib/xdp_stats/stats.txt
 ```
 
@@ -143,8 +144,23 @@ cat /var/lib/xdp_stats/stats.txt
 | `xdpfilter mode monitor\|enforce` | switch mode live |
 | `xdpfilter reload` | re-read the config live (also happens automatically on edit) |
 | `xdpfilter flows [--limit N] [--vlan V]` | sample the TCP and UDP flow tables |
+| `xdpfilter manage [--config P]` | interactive live dashboard, configuration, flows, and operations |
 | `xdpfilter tune [--dry-run]` | apply or preview the tuning profile |
 | `xdpfilter check` | preflight: config, interfaces, bpffs, memlock, root |
+
+### Interactive management console
+
+Run `sudo xdpfilter manage` on a terminal locally or over SSH. The CGO-free
+terminal interface exposes the live dashboard, policy and TTL switches,
+allowlist CRUD, bounded flow browsing, every structural/runtime/tuning option,
+and service operations. Changes are staged until **Ctrl-S** is pressed.
+
+The Apply preview classifies changes by operational impact. Policy, TTL, mode,
+and allowlist changes update the pinned BPF maps immediately. Flow-table sizes,
+runtime intervals, and tuning require a service restart. Interface, XDP mode,
+and pin-directory changes require a guarded detach/reattach and may briefly
+interrupt forwarding. The Operations section places datapath detach and tuning
+restore behind typed confirmations.
 
 Allow a host behind the box to receive unsolicited inbound connections (for example a DNS resolver on
 UDP 53). Edit the config and the daemon applies the change immediately, with no restart and no dropped
@@ -187,6 +203,14 @@ drop_bad_flags: true            # drop null / XMAS / SYN+FIN / SYN+RST / FIN-wit
 drop_udp_frags: false           # also drop non-first UDP fragments
 drop_vlan_deep: false           # drop frames with more 802.1Q tags than are inspected (2)
 reject_with_rst: false          # answer enforced inbound TCP drops with a RST to the source (see note below)
+flow_monitoring:
+  enabled: false                # sampled inbound per-flow PPS/Mbps monitoring
+  sample_every: 64              # power of two; 1 counts every packet
+  max_flows: 262144             # bounded sampled-flow LRU counter capacity
+  cidrs:
+    - cidr: 10.0.0.0/24         # protected IPv4 destinations; longest prefix wins
+      pps_threshold: 100000     # 0 disables this metric
+      mbps_threshold: 500       # decimal Mbit/s; 0 disables this metric
 flow_max: 16777216              # concrete TCP capacity selected during setup
 udp_flow_max: 4194304           # concrete UDP capacity selected during setup
 l1_size: 65536                  # concrete per-CPU slots (power of two; 0 disables)
@@ -213,6 +237,14 @@ Policy fields (`mode`, `oos_strict`, `allow_inbound_servers`, `allow_inbound_syn
 TTLs) are applied live when the file changes — through inotify, `xdpfilter reload`, or
 `systemctl reload xdpfilter`. Structural changes (interfaces, table sizes, `l1_size`, `lru_percpu`,
 `xdp_mode`) need a restart, which re-adopts the pinned data path without dropping traffic.
+
+Flow-monitoring enablement, sampling, CIDRs, and thresholds also reload live. Only
+`flow_monitoring.max_flows` needs a service restart because it changes the BPF map capacity.
+Monitoring runs exclusively on the untrusted-side XDP program and counts valid inbound IPv4 TCP/UDP
+tuples before policy enforcement, including traffic later dropped or reported as a would-drop. The
+disabled path returns before sampling or map lookups; when enabled, the default 1-in-64 sampler performs
+CIDR and counter-map work for only the selected packets. Overlapping CIDRs use the most-specific rule,
+and a flow is listed when either configured threshold is exceeded.
 
 ### `reject_with_rst`
 
@@ -244,6 +276,13 @@ Every 10 seconds the daemon writes `/var/lib/xdp_stats/stats.txt`: processed, re
 `l1 hits` totals, a breakdown of drops by reason (the table in [What it drops](#what-it-drops)), and a
 per-VLAN table. Counters are per-CPU, so collection does not contend with the data path. A drop-rate spike
 is flagged in the file and logged to the journal.
+
+Independently, every second the daemon atomically replaces
+`/var/lib/xdp_stats/flow_alerts.jsonl`. It is an NDJSON snapshot with one schema-versioned JSON object per
+currently over-threshold flow and is empty when there are no current violations. Each line includes the
+normalized protocol/protected/internet endpoint tuple, both VLAN IDs, estimated rates, thresholds,
+matched CIDR, sample factor, window length, and UTC observation time. `xdpfilter manage` provides CIDR
+rule editing and renders the same live snapshot in its **Flow Monitoring** section.
 
 
 ## License

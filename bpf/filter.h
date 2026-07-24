@@ -87,6 +87,24 @@ struct flow_val {
 	__u16 _pad;
 };
 
+/* Sampled inbound flow-volume monitoring. The LPM key is queried with a /32
+ * protected-host address; the trie selects whether any configured CIDR owns it. */
+struct flow_cidr_key {
+	__u32 prefixlen;
+	__u32 addr; /* IPv4 network byte order */
+};
+
+struct flow_monitor_key {
+	struct flow_key flow;
+	__u8 protocol; /* IPPROTO_TCP / IPPROTO_UDP */
+	__u8 _pad[3];
+};
+
+struct flow_counter {
+	__u64 packets; /* sampled packet count; userspace applies sample_every */
+	__u64 bytes;   /* sampled full-frame bytes */
+};
+
 /*
  * L1 flow cache entry — a per-CPU direct-mapped cache in front of the LRU flow
  * table. Established TCP (ST_EST) and UDP (ST_UDP) flows are hot at line rate;
