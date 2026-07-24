@@ -102,7 +102,7 @@ flow_monitoring:
   sample_every: ${FLOWSAMPLE:-64}
   max_flows: 65536
   cidrs:
-    - cidr: 10.0.0.0/24
+    - cidr: ${FLOWCIDR:-10.0.0.0/24}
       pps_threshold: ${FLOWPPS:-1000000}
       mbps_threshold: 0
 flow_max: 65536
@@ -265,6 +265,88 @@ for _ in $(seq 1 30); do
 	sleep 0.1
 done
 $clean_seen && ok "flow left the snapshot after the next clean window" || bad "flow alert did not clear"
+write_config false '[]'
+sleep 1
+
+# ---- Test 5c: CIDR filtering includes only configured protected IPs ----
+log "Test 5c: flow monitoring filters protected IPs by CIDR"
+ip netns exec host ip addr add 10.0.1.2/24 dev h0
+ip netns exec inet ip addr add 10.0.1.3/24 dev i0
+if ip netns exec inet ping -c1 -W2 10.0.1.2 >/dev/null 2>&1; then
+	info "secondary protected subnet is reachable"
+else
+	bad "secondary protected subnet setup failed"
+fi
+FLOWMON=true FLOWSAMPLE=1 FLOWPPS=10 FLOWCIDR=10.0.0.2/32 write_config false '[]'
+sleep 2 # live reload + clean baseline
+ip netns exec inet python3 -c '
+import socket
+for target, port in (("10.0.0.2", 9997), ("10.0.1.2", 9996)):
+    s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    for i in range(200): s.sendto(b"x"*100,(target,port))
+    s.close()
+'
+filtered_seen=false
+for _ in $(seq 1 30); do
+	if [ -s "$STATS/flow_alerts.jsonl" ]; then filtered_seen=true; break; fi
+	sleep 0.1
+done
+if $filtered_seen && python3 - "$STATS/flow_alerts.jsonl" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    rows=[json.loads(line) for line in f if line.strip()]
+included=[r for r in rows if r["flow"]["protected_ip"] == "10.0.0.2" and r["flow"]["protected_port"] == 9997]
+excluded=[r for r in rows if r["flow"]["protected_ip"] == "10.0.1.2" or r["flow"]["protected_port"] == 9996]
+assert included and not excluded
+assert all(r["matched_cidr"] == "10.0.0.2/32" for r in included)
+PY
+then
+	ok "CIDR filter alerted for 10.0.0.2/32 and excluded equal traffic to 10.0.1.2"
+else
+	bad "CIDR-filtered alert snapshot was wrong"; sed 's/^/    /' "$STATS/flow_alerts.jsonl" 2>/dev/null
+fi
+
+# ---- Test 5d: trusted-side traffic never consumes flow-monitor resources ----
+log "Test 5d: flow monitoring ignores the trusted side"
+clean_seen=false
+for _ in $(seq 1 30); do
+	if [ -f "$STATS/flow_alerts.jsonl" ] && [ ! -s "$STATS/flow_alerts.jsonl" ]; then clean_seen=true; break; fi
+	sleep 0.1
+done
+if ! $clean_seen; then
+	bad "flow alert snapshot did not clear before trusted-side test"
+else
+	# Synchronize just after an empty one-second snapshot, then watch through two
+	# more snapshots so a wrongly-accounted outbound burst cannot be missed.
+	tick=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$STATS/flow_alerts.jsonl")
+	for _ in $(seq 1 30); do
+		next=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$STATS/flow_alerts.jsonl")
+		[ "$next" != "$tick" ] && { tick="$next"; break; }
+		sleep 0.1
+	done
+	ip netns exec host python3 -c '
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+for i in range(200): s.sendto(b"x"*100,("10.0.0.3",9995))
+'
+	trusted_alert=false
+	changes=0
+	for _ in $(seq 1 35); do
+		[ -s "$STATS/flow_alerts.jsonl" ] && trusted_alert=true
+		next=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$STATS/flow_alerts.jsonl")
+		if [ "$next" != "$tick" ]; then
+			tick="$next"
+			changes=$((changes+1))
+			[ "$changes" -ge 2 ] && break
+		fi
+		sleep 0.1
+	done
+	if ! $trusted_alert && [ "$changes" -ge 2 ]; then
+		ok "outbound trusted-side flood stayed out of flow monitoring"
+	else
+		bad "trusted-side traffic appeared in flow alerts (alert=$trusted_alert snapshots=$changes)"
+	fi
+fi
 write_config false '[]'
 sleep 1
 

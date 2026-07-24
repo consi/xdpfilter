@@ -35,6 +35,7 @@ type ui struct {
 	header, footer, dashboard                        *tview.TextView
 	allowTable, flowTable                            *tview.Table
 	flowMonitorRules, flowMonitorAlerts              *tview.Table
+	flowMonitorEngine, flowMonitorEditor             *tview.Form
 	allowInput                                       *tview.InputField
 	flowMonitorCIDR, flowMonitorPPS, flowMonitorMbps *tview.InputField
 	allowSelected                                    int
@@ -273,18 +274,24 @@ func (u *ui) flowsView() tview.Primitive {
 
 func (u *ui) flowMonitoringView() tview.Primitive {
 	c := u.ctrl.Staged
-	form := tview.NewForm()
-	form.SetHorizontal(true).SetItemPadding(0)
-	form.SetBorder(true).SetTitle(" Flow monitoring (sample 1/N; threshold 0 = off) ")
-	form.AddCheckbox("On", c.FlowMonitoring.Enabled, func(v bool) { c.FlowMonitoring.Enabled = v; u.changed() })
-	u.addU32Width(form, "1/N", "flow_monitoring.sample_every", c.FlowMonitoring.SampleEvery, 4, func(v uint32) { c.FlowMonitoring.SampleEvery = v })
-	u.addU32Width(form, "Max", "flow_monitoring.max_flows", c.FlowMonitoring.MaxFlows, 8, func(v uint32) { c.FlowMonitoring.MaxFlows = v })
+	u.flowMonitorEngine = tview.NewForm()
+	u.flowMonitorEngine.SetHorizontal(true).SetItemPadding(1)
+	u.flowMonitorEngine.SetBorderPadding(0, 0, 1, 1)
+	u.flowMonitorEngine.SetBorder(true).SetTitle(" Flow monitoring engine (sample 1/N) ")
+	u.flowMonitorEngine.AddCheckbox("Enabled", c.FlowMonitoring.Enabled, func(v bool) { c.FlowMonitoring.Enabled = v; u.changed() })
+	u.addU32Width(u.flowMonitorEngine, "Sample 1/N", "flow_monitoring.sample_every", c.FlowMonitoring.SampleEvery, 6, func(v uint32) { c.FlowMonitoring.SampleEvery = v })
+	u.addU32Width(u.flowMonitorEngine, "Max flows", "flow_monitoring.max_flows", c.FlowMonitoring.MaxFlows, 9, func(v uint32) { c.FlowMonitoring.MaxFlows = v })
 
 	u.flowMonitorCIDR = tview.NewInputField().SetLabel("CIDR ").SetFieldWidth(18)
 	u.flowMonitorPPS = tview.NewInputField().SetLabel("PPS ").SetText("0").SetFieldWidth(9)
 	u.flowMonitorMbps = tview.NewInputField().SetLabel("Mbps ").SetText("0").SetFieldWidth(8)
-	form.AddFormItem(u.flowMonitorCIDR).AddFormItem(u.flowMonitorPPS).AddFormItem(u.flowMonitorMbps)
-	form.AddButton("Add / Replace", u.saveFlowMonitorRule).AddButton("Delete CIDR", u.deleteFlowMonitorRule)
+	u.flowMonitorEditor = tview.NewForm()
+	u.flowMonitorEditor.SetHorizontal(true).SetItemPadding(0)
+	u.flowMonitorEditor.SetBorderPadding(0, 0, 1, 1)
+	u.flowMonitorEditor.SetBorder(true).SetTitle(" CIDR thresholds (0 disables PPS or Mbps) ")
+	u.flowMonitorEditor.AddFormItem(u.flowMonitorCIDR).AddFormItem(u.flowMonitorPPS).AddFormItem(u.flowMonitorMbps)
+	u.flowMonitorEditor.AddButton("Add / Replace", u.saveFlowMonitorRule).AddButton("Delete CIDR", u.deleteFlowMonitorRule)
+	u.linkFlowMonitorForms()
 
 	u.flowMonitorRules = tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 	u.flowMonitorRules.SetBorder(true).SetTitle(" CIDR rules — longest prefix wins ")
@@ -302,9 +309,43 @@ func (u *ui) flowMonitoringView() tview.Primitive {
 	u.updateFlowMonitorRules()
 
 	return tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(form, 9, 0, true).
+		AddItem(u.flowMonitorEngine, 3, 0, true).
+		AddItem(u.flowMonitorEditor, 5, 0, false).
 		AddItem(u.flowMonitorRules, 5, 0, false).
 		AddItem(u.flowMonitorAlerts, 0, 1, false)
+}
+
+// linkFlowMonitorForms preserves natural Tab traversal while keeping engine
+// settings and CIDR rule editing in visually separate forms.
+func (u *ui) linkFlowMonitorForms() {
+	u.flowMonitorEngine.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		item, _ := u.flowMonitorEngine.GetFocusedItemIndex()
+		if ev.Key() == tcell.KeyTab && item == u.flowMonitorEngine.GetFormItemCount()-1 {
+			u.flowMonitorEditor.SetFocus(0)
+			u.app.SetFocus(u.flowMonitorEditor)
+			return nil
+		}
+		if ev.Key() == tcell.KeyBacktab && item == 0 {
+			u.flowMonitorEditor.SetFocus(u.flowMonitorEditor.GetFormItemCount() + u.flowMonitorEditor.GetButtonCount() - 1)
+			u.app.SetFocus(u.flowMonitorEditor)
+			return nil
+		}
+		return ev
+	})
+	u.flowMonitorEditor.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		item, button := u.flowMonitorEditor.GetFocusedItemIndex()
+		if ev.Key() == tcell.KeyTab && button == u.flowMonitorEditor.GetButtonCount()-1 {
+			u.flowMonitorEngine.SetFocus(0)
+			u.app.SetFocus(u.flowMonitorEngine)
+			return nil
+		}
+		if ev.Key() == tcell.KeyBacktab && item == 0 {
+			u.flowMonitorEngine.SetFocus(u.flowMonitorEngine.GetFormItemCount() - 1)
+			u.app.SetFocus(u.flowMonitorEngine)
+			return nil
+		}
+		return ev
+	})
 }
 
 func (u *ui) saveFlowMonitorRule() {
